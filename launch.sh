@@ -84,7 +84,10 @@ if [ -z "$PYTHON" ]; then
 fi
 PYTHON_VER="$($PYTHON --version 2>&1)"
 
-# GPU detection
+# GPU detection.
+# PyTorch CUDA wheels work on the driver alone; whisper.cpp's -DGGML_CUDA=ON
+# additionally requires the CUDA Toolkit (nvcc). Gate them independently so a
+# driver-only system still gets GPU torch but falls back to CPU whisper.cpp.
 GPU_BUILD=""
 TORCH_INDEX="https://download.pytorch.org/whl/cpu"
 GPU_TYPE="none"
@@ -93,7 +96,6 @@ if command -v nvidia-smi &>/dev/null; then
     GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
     if [ -n "$GPU_NAME" ]; then
         GPU_TYPE="cuda"
-        GPU_BUILD="-DGGML_CUDA=ON"
         NVCC_VER=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' || true)
         if [[ "$NVCC_VER" == 12.* ]]; then
             TORCH_INDEX="https://download.pytorch.org/whl/cu124"
@@ -101,6 +103,13 @@ if command -v nvidia-smi &>/dev/null; then
             TORCH_INDEX="https://download.pytorch.org/whl/cu118"
         else
             TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+        fi
+        if [ -n "$NVCC_VER" ]; then
+            GPU_BUILD="-DGGML_CUDA=ON"
+        else
+            warn "CUDA Toolkit (nvcc) not found — whisper.cpp will build for CPU."
+            warn "PyTorch will still use the GPU. To enable GPU in whisper.cpp later,"
+            warn "install the CUDA Toolkit and rerun this script."
         fi
     fi
 fi
@@ -178,21 +187,33 @@ if [ $needs_venv -eq 1 ]; then
     info "Creating Python virtual environment..."
     rm -rf "$VENV_DIR"
     $PYTHON -m venv "$VENV_DIR"
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+        err "Failed to create virtual environment at $VENV_DIR"
+        exit 1
+    fi
     echo "$PYTHON_VER" > "$STATE_DIR/venv"
     needs_pip=1  # force pip install in new venv
     ok "Virtual environment created"
 fi
 
+# Bind pip to the venv's python directly. Modern pip (>=22) rejects
+# `pip install --upgrade pip` with "To modify pip, please run the following
+# command", so all pip use must go through `python -m pip`.
+VENV_PYTHON="$VENV_DIR/bin/python"
+pip_install() { "$VENV_PYTHON" -m pip install "$@"; }
+
 # 3c: Pip deps
 if [ $needs_pip -eq 1 ]; then
     info "Installing Python packages (this may take a few minutes)..."
-    source "$VENV_DIR/bin/activate"
-    pip install --upgrade pip wheel setuptools -q
-    pip install numpy soundfile -q
-    # PyGObject deps (Linux GUI)
-    pip install PyGObject pycairo -q 2>/dev/null || warn "PyGObject install failed (GUI may not work)"
-    pip install torch torchaudio --index-url "$TORCH_INDEX" -q
-    pip install pyannote.audio -q
+    if ! pip_install --upgrade pip wheel setuptools -q; then
+        warn "pip self-upgrade failed; continuing with existing pip"
+    fi
+    pip_install numpy soundfile -q || { err "Failed to install numpy/soundfile"; exit 1; }
+    # PyGObject deps (Linux GUI) — soft-fail since CLI still works without it
+    pip_install PyGObject pycairo -q 2>/dev/null || warn "PyGObject install failed (GUI may not work)"
+    pip_install torch torchaudio --index-url "$TORCH_INDEX" -q \
+        || { err "Failed to install torch/torchaudio from $TORCH_INDEX"; exit 1; }
+    pip_install pyannote.audio -q || { err "Failed to install pyannote.audio"; exit 1; }
     echo "$DEP_HASH" > "$STATE_DIR/pip_deps"
     ok "Python packages installed"
 fi
@@ -206,9 +227,51 @@ if [ $needs_whisper -eq 1 ]; then
         info "Cloning whisper.cpp..."
         git clone https://github.com/ggerganov/whisper.cpp.git "$WHISPER_DIR" -q
     fi
-    info "Building whisper.cpp (this may take a few minutes)..."
-    cmake -B "$WHISPER_DIR/build" -S "$WHISPER_DIR" $GPU_BUILD -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -3
-    cmake --build "$WHISPER_DIR/build" -j"$(nproc)" --target whisper-cli 2>&1 | tail -3
+
+    LOG_DIR="$STATE_DIR/logs"; mkdir -p "$LOG_DIR"
+    CFG_LOG="$LOG_DIR/cmake-configure.log"
+    BLD_LOG="$LOG_DIR/cmake-build.log"
+    BUILD_DIR="$WHISPER_DIR/build"
+    WHISPER_BIN="$BUILD_DIR/bin/whisper-cli"
+
+    # Try a build with the given extra flags. Returns non-zero on failure and
+    # prints the tail of the relevant log. Crucially, we check the configure
+    # exit code before invoking `cmake --build` — otherwise a misleading
+    # "no project file" error replaces the real CUDA / compiler error.
+    try_build() {
+        local label="$1"; shift
+        rm -rf "$BUILD_DIR"
+        info "Configuring whisper.cpp ($label)..."
+        if ! cmake -B "$BUILD_DIR" -S "$WHISPER_DIR" -DCMAKE_BUILD_TYPE=Release "$@" >"$CFG_LOG" 2>&1; then
+            err "CMake configure failed. Last lines:"
+            tail -n 15 "$CFG_LOG" | sed 's/^/    /'
+            info "Full log: $CFG_LOG"
+            return 1
+        fi
+        info "Building whisper.cpp (this may take a few minutes)..."
+        if ! cmake --build "$BUILD_DIR" -j"$(nproc)" --target whisper-cli >"$BLD_LOG" 2>&1; then
+            err "CMake build failed. Last lines:"
+            tail -n 20 "$BLD_LOG" | sed 's/^/    /'
+            info "Full log: $BLD_LOG"
+            return 1
+        fi
+        [ -x "$WHISPER_BIN" ]
+    }
+
+    built=0
+    if [ -n "$GPU_BUILD" ]; then
+        # shellcheck disable=SC2086  # $GPU_BUILD is intentionally word-split
+        if try_build "GPU" $GPU_BUILD; then built=1; else warn "GPU build failed — retrying with CPU build."; fi
+    fi
+    if [ $built -eq 0 ]; then
+        if try_build "CPU"; then built=1; fi
+    fi
+    if [ $built -eq 0 ]; then
+        err "whisper.cpp build failed even with CPU fallback."
+        err "Logs:  $CFG_LOG  /  $BLD_LOG"
+        exit 1
+    fi
+
     NEW_HEAD=$(git -C "$WHISPER_DIR" rev-parse HEAD)
     echo "$NEW_HEAD" > "$STATE_DIR/whisper_build"
     ok "whisper.cpp built"
@@ -236,8 +299,9 @@ if [ $needs_venv -eq 0 ] && [ $needs_pip -eq 0 ] && [ $needs_whisper -eq 0 ] && 
 fi
 
 # 3g: HuggingFace token (required for pyannote diarization models)
-source "$VENV_DIR/bin/activate"
-HF_TOKEN=$(python3 -c "from huggingface_hub import get_token; t = get_token(); print(t or '')" 2>/dev/null)
+# Use the venv python directly — no need to source activate.
+VENV_PYTHON="${VENV_PYTHON:-$VENV_DIR/bin/python}"
+HF_TOKEN=$("$VENV_PYTHON" -c "from huggingface_hub import get_token; t = get_token(); print(t or '')" 2>/dev/null)
 if [ -z "$HF_TOKEN" ]; then
     header "HuggingFace Setup Required"
     echo ""
@@ -254,7 +318,9 @@ if [ -z "$HF_TOKEN" ]; then
     echo ""
     read -p "  Paste your HuggingFace token here (starts with hf_): " hf_input
     if [ -n "$hf_input" ]; then
-        python3 -c "from huggingface_hub import login; login(token='$hf_input')" 2>&1
+        # Pass token via env var rather than embedding it in the python -c
+        # string — avoids quoting bugs if the token contains shell metacharacters.
+        S2T_HF_TOKEN="$hf_input" "$VENV_PYTHON" -c "import os; from huggingface_hub import login; login(token=os.environ['S2T_HF_TOKEN'])" 2>&1
         if [ $? -eq 0 ]; then
             ok "HuggingFace token saved"
         else
@@ -262,11 +328,11 @@ if [ -z "$HF_TOKEN" ]; then
         fi
     else
         warn "No token entered. Diarization will fail until you set one."
-        warn "You can run this again or: python3 -c \"from huggingface_hub import login; login()\""
+        warn "You can run this again or: $VENV_PYTHON -c \"from huggingface_hub import login; login()\""
     fi
 else
     # Verify model access
-    HF_ACCESS=$(python3 -c "
+    HF_ACCESS=$("$VENV_PYTHON" -c "
 from huggingface_hub import model_info
 try:
     model_info('pyannote/speaker-diarization-3.1')
@@ -289,7 +355,6 @@ fi
 
 # ── Phase 4: Launch ───────────────────────────────────────────
 header "Launching Speech2Text"
-pip install --upgrade pip -q 2>/dev/null
 # Pick up system paths for ffmpeg etc.
 [ -f /home/linuxbrew/.linuxbrew/bin/brew ] && eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv 2>/dev/null)" || true
-exec python3 "$REPO_DIR/gui.py" "$@"
+exec "$VENV_PYTHON" "$REPO_DIR/gui.py" "$@"

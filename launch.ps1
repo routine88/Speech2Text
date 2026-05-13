@@ -28,6 +28,23 @@ function Write-Header($msg) { Write-Host "`n-- $msg --" -ForegroundColor White }
 
 function Test-Command($cmd) { $null -ne (Get-Command $cmd -ErrorAction SilentlyContinue) }
 
+# Path to the venv's python.exe (set later, used by Invoke-Pip)
+$script:VenvPython = $null
+
+# Run pip via `python -m pip` using the venv interpreter directly. Modern pip
+# (>=22) refuses self-upgrade via `pip install --upgrade pip` and returns
+# non-zero, which silently broke setup. Going through `python -m pip` avoids
+# both that and any reliance on Activate.ps1 having mutated PATH correctly.
+function Invoke-Pip {
+    param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $PipArgs)
+    if (-not $script:VenvPython -or -not (Test-Path $script:VenvPython)) {
+        throw "Venv python not found at '$script:VenvPython'. Create the venv first."
+    }
+    & $script:VenvPython -m pip @PipArgs
+    # Do not `return $LASTEXITCODE` — that would write the int to the pipeline.
+    # Caller should check $LASTEXITCODE directly after this call.
+}
+
 function Install-Winget($packageId, $name) {
     Write-Info "Installing $name via winget..."
     $result = winget install --id $packageId --accept-source-agreements --accept-package-agreements -e 2>&1
@@ -237,6 +254,9 @@ if ($needsRestart) {
 }
 
 # GPU detection (CUDA only on Windows)
+# Note: PyTorch CUDA wheels work on the driver alone — no CUDA Toolkit needed.
+# But building whisper.cpp with -DGGML_CUDA=ON requires the CUDA Toolkit (nvcc).
+# So GPU torch wheels and GPU whisper build are gated independently.
 $GPU_BUILD = ""
 $TORCH_INDEX = "https://download.pytorch.org/whl/cpu"
 $GPU_TYPE = "none"
@@ -248,23 +268,50 @@ if (Test-Command "nvidia-smi") {
     $nvidiaSmi = "C:\Windows\System32\nvidia-smi.exe"
 }
 
+# Locate nvcc — winget-installed CUDA isn't always on PATH, so probe common paths.
+function Find-Nvcc {
+    if (Test-Command "nvcc") { return (Get-Command "nvcc").Source }
+    $candidates = @()
+    if ($env:CUDA_PATH) { $candidates += (Join-Path $env:CUDA_PATH "bin\nvcc.exe") }
+    $cudaRoot = "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA"
+    if (Test-Path $cudaRoot) {
+        Get-ChildItem $cudaRoot -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { $candidates += (Join-Path $_.FullName "bin\nvcc.exe") }
+    }
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path $c)) {
+            $env:Path = (Split-Path $c) + ";" + $env:Path
+            return $c
+        }
+    }
+    return $null
+}
+
 if ($nvidiaSmi) {
     try {
         $gpuName = & $nvidiaSmi --query-gpu=name --format=csv,noheader 2>$null | Select-Object -First 1
         if ($gpuName) {
             $GPU_TYPE = "cuda"
-            $GPU_BUILD = "-DGGML_CUDA=ON"
             $TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
-            Write-Ok "NVIDIA GPU: $gpuName (CUDA enabled)"
+            Write-Ok "NVIDIA GPU: $gpuName"
 
-            if (Test-Command "nvcc") {
-                $nvccOut = nvcc --version 2>&1
+            $nvccPath = Find-Nvcc
+            if ($nvccPath) {
+                $nvccOut = & $nvccPath --version 2>&1
+                $cudaVer = ""
                 if ($nvccOut -match "release (\d+\.\d+)") {
                     $cudaVer = $Matches[1]
                     if ($cudaVer -like "11.*") {
                         $TORCH_INDEX = "https://download.pytorch.org/whl/cu118"
                     }
                 }
+                $GPU_BUILD = "-DGGML_CUDA=ON"
+                Write-Ok "CUDA Toolkit: $cudaVer (GPU build enabled)"
+            } else {
+                Write-Warn "CUDA Toolkit (nvcc) not found — whisper.cpp will build for CPU."
+                Write-Warn "PyTorch will still use the GPU. To enable GPU in whisper.cpp later:"
+                Write-Warn "  winget install Nvidia.CUDA  (then rerun launch.bat)"
             }
         }
     } catch {}
@@ -326,19 +373,47 @@ if ($needsVenv) {
     Write-Info "Creating Python virtual environment..."
     if (Test-Path $VENV_DIR) { Remove-Item $VENV_DIR -Recurse -Force }
     & $PYTHON -m venv $VENV_DIR
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $VENV_DIR "Scripts\python.exe"))) {
+        Write-Err "Failed to create virtual environment at $VENV_DIR"
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
     Set-Content -Path $venvMarker -Value $PYTHON_VER
     $needsPip = $true
     Write-Ok "Virtual environment created"
 }
 
+# Bind pip to the venv's python — must happen after venv exists, before any Invoke-Pip.
+$script:VenvPython = Join-Path $VENV_DIR "Scripts\python.exe"
+if (-not (Test-Path $script:VenvPython)) {
+    Write-Err "Venv python missing at $script:VenvPython — delete the venv folder and rerun."
+    Read-Host "Press Enter to exit"
+    exit 1
+}
+
 # 3b: Pip deps
 if ($needsPip) {
     Write-Info "Installing Python packages (this may take a few minutes)..."
-    & (Join-Path $VENV_DIR "Scripts\Activate.ps1")
-    pip install --upgrade pip wheel setuptools -q
-    pip install numpy soundfile -q
-    pip install torch torchaudio --index-url $TORCH_INDEX -q
-    pip install pyannote.audio -q
+    # Upgrade pip via `python -m pip` — `pip install --upgrade pip` is rejected
+    # by modern pip with "To modify pip, please run the following command".
+    Invoke-Pip install --upgrade pip wheel setuptools
+    if ($LASTEXITCODE -ne 0) { Write-Warn "pip self-upgrade failed; continuing with existing pip" }
+
+    Invoke-Pip install numpy soundfile
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to install numpy/soundfile"
+        Read-Host "Press Enter to exit"; exit 1
+    }
+    Invoke-Pip install torch torchaudio --index-url $TORCH_INDEX
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to install torch/torchaudio from $TORCH_INDEX"
+        Read-Host "Press Enter to exit"; exit 1
+    }
+    Invoke-Pip install pyannote.audio
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to install pyannote.audio"
+        Read-Host "Press Enter to exit"; exit 1
+    }
     Set-Content -Path $pipMarker -Value $depHash
     Write-Ok "Python packages installed"
 }
@@ -360,19 +435,64 @@ if ($needsWhisper) {
         git clone https://github.com/ggerganov/whisper.cpp.git $WHISPER_DIR -q
     }
 
-    Write-Info "Building whisper.cpp (this may take a few minutes)..."
-    $cmakeArgs = @("-B", (Join-Path $WHISPER_DIR "build"), "-S", $WHISPER_DIR, "-DCMAKE_BUILD_TYPE=Release")
-    if ($GPU_BUILD) { $cmakeArgs += $GPU_BUILD }
-    cmake @cmakeArgs 2>&1 | Select-Object -Last 5
-    cmake --build (Join-Path $WHISPER_DIR "build") --config Release --target whisper-cli 2>&1 | Select-Object -Last 5
+    $buildDir = Join-Path $WHISPER_DIR "build"
+    $logDir   = Join-Path $STATE_DIR "logs"
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    $cfgLog   = Join-Path $logDir "cmake-configure.log"
+    $bldLog   = Join-Path $logDir "cmake-build.log"
 
-    if (Test-Path $whisperCliPath) {
+    # Returns $true on success. On failure, prints tail of log and returns $false.
+    # cmake config can fail (e.g. "CUDA Toolkit not found") and then `cmake --build`
+    # produces a misleading MSB1009 — so we MUST check exit code after configure.
+    function Invoke-WhisperBuild {
+        param([bool] $UseGpu)
+        # Fresh configure each attempt — CMakeCache.txt caches the previous failure.
+        if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+        $cmakeArgs = @("-B", $buildDir, "-S", $WHISPER_DIR, "-DCMAKE_BUILD_TYPE=Release")
+        if ($UseGpu -and $GPU_BUILD) { $cmakeArgs += $GPU_BUILD }
+
+        Write-Info ("Configuring whisper.cpp (" + $(if ($UseGpu -and $GPU_BUILD) { "GPU" } else { "CPU" }) + ")...")
+        & cmake @cmakeArgs *>&1 | Tee-Object -FilePath $cfgLog | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "CMake configure failed (exit $LASTEXITCODE). Last lines:"
+            Get-Content $cfgLog -Tail 15 | ForEach-Object { Write-Host "    $_" }
+            Write-Info "Full log: $cfgLog"
+            return $false
+        }
+
+        Write-Info "Building whisper.cpp (this may take a few minutes)..."
+        & cmake --build $buildDir --config Release --target whisper-cli *>&1 |
+            Tee-Object -FilePath $bldLog | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $whisperCliPath)) {
+            Write-Err "CMake build failed (exit $LASTEXITCODE). Last lines:"
+            Get-Content $bldLog -Tail 20 | ForEach-Object { Write-Host "    $_" }
+            Write-Info "Full log: $bldLog"
+            return $false
+        }
+        return $true
+    }
+
+    $built = $false
+    if ($GPU_BUILD) {
+        $built = Invoke-WhisperBuild -UseGpu $true
+        if (-not $built) {
+            Write-Warn "GPU build failed — retrying with CPU build."
+            $GPU_BUILD = ""
+            $built = Invoke-WhisperBuild -UseGpu $false
+        }
+    } else {
+        $built = Invoke-WhisperBuild -UseGpu $false
+    }
+
+    if ($built) {
         $newHead = git -C $WHISPER_DIR rev-parse HEAD 2>$null
         Set-Content -Path (Join-Path $STATE_DIR "whisper_build") -Value $newHead
         Write-Ok "whisper.cpp built"
     } else {
-        Write-Err "whisper.cpp build failed. The binary was not found at: $whisperCliPath"
-        Write-Err "You may need Visual Studio Build Tools with C++ workload."
+        Write-Err "whisper.cpp build failed even with CPU fallback."
+        Write-Err "You may need Visual Studio Build Tools with the C++ workload."
+        Write-Err "Logs:  $cfgLog  /  $bldLog"
         Read-Host "Press Enter to exit"
         exit 1
     }
@@ -415,8 +535,7 @@ if (-not $anyWork) {
 }
 
 # 3f: HuggingFace token (required for pyannote diarization models)
-& (Join-Path $VENV_DIR "Scripts\Activate.ps1")
-$hfToken = python -c "from huggingface_hub import get_token; t = get_token(); print(t or '')" 2>$null
+$hfToken = & $script:VenvPython -c "from huggingface_hub import get_token; t = get_token(); print(t or '')" 2>$null
 if (-not $hfToken -or $hfToken -eq "") {
     Write-Header "HuggingFace Setup Required"
     Write-Host ""
@@ -433,8 +552,13 @@ if (-not $hfToken -or $hfToken -eq "") {
     Write-Host ""
     $hfInput = Read-Host "  Paste your HuggingFace token here (starts with hf_)"
     if ($hfInput) {
-        python -c "from huggingface_hub import login; login(token='$hfInput')" 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        # Pass token via env var rather than string interpolation — avoids quoting bugs
+        # if the token ever contains characters PowerShell would mangle.
+        $env:S2T_HF_TOKEN = $hfInput
+        & $script:VenvPython -c "import os; from huggingface_hub import login; login(token=os.environ['S2T_HF_TOKEN'])" 2>&1
+        $loginExit = $LASTEXITCODE
+        Remove-Item Env:\S2T_HF_TOKEN -ErrorAction SilentlyContinue
+        if ($loginExit -eq 0) {
             Write-Ok "HuggingFace token saved"
         } else {
             Write-Warn "Token may be invalid, but continuing anyway"
@@ -443,7 +567,7 @@ if (-not $hfToken -or $hfToken -eq "") {
         Write-Warn "No token entered. Diarization will fail until you set one."
     }
 } else {
-    $hfAccess = python -c @"
+    $hfAccess = & $script:VenvPython -c @"
 from huggingface_hub import model_info
 try:
     model_info('pyannote/speaker-diarization-3.1')
@@ -466,7 +590,6 @@ except Exception as e:
 
 # ── Phase 4: Launch ───────────────────────────────────────────
 Write-Header "Launching Speech2Text"
-pip install --upgrade pip -q 2>$null
 
 # Choose GUI: gui_tk.py (tkinter, cross-platform) > gui.py (GTK4, Linux-only) > CLI
 $guiTk  = Join-Path $REPO_DIR "gui_tk.py"
@@ -475,16 +598,16 @@ $cli    = Join-Path $REPO_DIR "transcribe.py"
 
 if (Test-Path $guiTk) {
     Write-Info "Starting GUI..."
-    python $guiTk @args
+    & $script:VenvPython $guiTk @args
 } elseif (Test-Path $guiGtk) {
     try {
-        python $guiGtk @args
+        & $script:VenvPython $guiGtk @args
     } catch {
         Write-Warn "GTK4 GUI not available on Windows. Falling back to CLI."
         Write-Info "Usage:  python $cli <audio_file> [options]"
-        python $cli --help
+        & $script:VenvPython $cli --help
     }
 } else {
     Write-Info "Usage:  python $cli <audio_file> [options]"
-    python $cli --help
+    & $script:VenvPython $cli --help
 }
