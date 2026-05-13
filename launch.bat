@@ -1,5 +1,5 @@
 @echo off
-REM Speech2Text — One-Click Launcher (Windows)
+REM Speech2Text -- One-Click Launcher (Windows)
 REM Double-click this file to install/update and launch Speech2Text.
 REM The sentinel below tells launch.ps1 that this wrapper will keep the
 REM window open, so the .ps1 does not have to add its own pause.
