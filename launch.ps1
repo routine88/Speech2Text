@@ -174,7 +174,6 @@ $VENV_DIR  = Join-Path $REPO_DIR "venv"
 New-Item -ItemType Directory -Path $STATE_DIR -Force | Out-Null
 
 # -- Auto-install system dependencies -------------------------
-$needsRestart = $false
 
 # Python
 $PYTHON = $null
@@ -249,29 +248,76 @@ if (-not (Test-Command "ffmpeg")) {
     }
 }
 
-# C++ Build Tools -- check for cl.exe or Visual Studio
-$hasCL = $false
-if (Test-Command "cl") { $hasCL = $true }
-if (-not $hasCL) {
-    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    if (Test-Path $vswhere) {
-        $vsPath = & $vswhere -latest -property installationPath 2>$null
-        if ($vsPath) { $hasCL = $true }
+# C++ Build Tools detection.
+# Previous check (Test-Command cl + bare vswhere) was wrong on both ends:
+# cl.exe is only on PATH inside a VS Developer Prompt (never in a normal
+# shell), and `vswhere -latest -property installationPath` matches ANY VS
+# install -- including ones with no C++ workload, which can't build whisper.cpp.
+# We now use `vswhere -requires` to demand the VC.Tools.x86.x64 component,
+# which is what we'd be installing anyway, and store the install metadata so
+# the CMake step can pass `-G "Visual Studio NN YYYY"` instead of relying on
+# cl.exe being on PATH (it isn't, and adding it there would also need the
+# Windows SDK paths -- much simpler to let CMake locate MSVC via vswhere).
+function Find-VSInstall {
+    $vswhereLocations = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"),
+        (Join-Path $env:ProgramFiles         "Microsoft Visual Studio\Installer\vswhere.exe")
+    )
+    foreach ($vswhere in $vswhereLocations) {
+        if (-not $vswhere -or -not (Test-Path $vswhere)) { continue }
+        $json = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -format json 2>$null | Out-String
+        if (-not $json) { continue }
+        try {
+            $parsed = $json | ConvertFrom-Json
+            if ($parsed -and $parsed.Count -gt 0) {
+                return [PSCustomObject]@{
+                    InstallationPath    = $parsed[0].installationPath
+                    InstallationVersion = $parsed[0].installationVersion
+                }
+            }
+        } catch {}
+    }
+    return $null
+}
+
+function Get-VSGenerator {
+    param([string] $InstallationVersion)
+    if (-not $InstallationVersion) { return $null }
+    $major = 0
+    [void][int]::TryParse(($InstallationVersion -split '\.')[0], [ref] $major)
+    switch ($major) {
+        17 { return "Visual Studio 17 2022" }
+        16 { return "Visual Studio 16 2019" }
+        15 { return "Visual Studio 15 2017" }
+        default { return $null }
     }
 }
-if (-not $hasCL) {
+
+$script:VSInstall   = Find-VSInstall
+$script:VSGenerator = if ($script:VSInstall) { Get-VSGenerator $script:VSInstall.InstallationVersion } else { $null }
+
+if (-not $script:VSInstall) {
     Write-Header "Installing Visual Studio Build Tools"
     if ($hasWinget) {
         Write-Info "Installing C++ build tools (this may take several minutes)..."
-        $result = winget install --id Microsoft.VisualStudio.2022.BuildTools `
+        winget install --id Microsoft.VisualStudio.2022.BuildTools `
             --accept-source-agreements --accept-package-agreements `
-            --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended" 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Ok "Visual Studio Build Tools installed"
-            $needsRestart = $true
+            --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended" 2>&1 | Out-Host
+        # winget often returns non-zero even on success (installer service runs
+        # async, "needs reboot" pseudo-errors, etc.), so trust detection rather
+        # than $LASTEXITCODE. Re-probe with vswhere.
+        $script:VSInstall   = Find-VSInstall
+        $script:VSGenerator = if ($script:VSInstall) { Get-VSGenerator $script:VSInstall.InstallationVersion } else { $null }
+        if ($script:VSInstall) {
+            Write-Ok "Visual Studio Build Tools detected at $($script:VSInstall.InstallationPath)"
         } else {
-            Write-Warn "Build Tools install may need a restart to complete."
-            $needsRestart = $true
+            Write-Warn ""
+            Write-Warn "Build Tools install did not complete in this session."
+            Write-Warn "This is usually because the installer service needs a reboot."
+            Write-Warn "Reboot and re-run launch.bat -- you should not see this prompt again."
+            Read-Host "Press Enter to continue anyway (build will likely fail)"
         }
     } else {
         Write-Err "C++ Build Tools are required to compile whisper.cpp."
@@ -280,15 +326,8 @@ if (-not $hasCL) {
         Read-Host "Press Enter to exit"
         exit 1
     }
-}
-
-if ($needsRestart) {
-    Write-Warn ""
-    Write-Warn "Build tools were just installed. You may need to restart your terminal"
-    Write-Warn "or reboot for PATH changes to take effect, then double-click launch.bat again."
-    Write-Warn ""
-    Write-Warn "If you just rebooted and see this again, the install may still be finishing."
-    Read-Host "Press Enter to continue anyway (or close and restart)"
+} else {
+    Write-Ok "Visual Studio Build Tools: $($script:VSInstall.InstallationVersion) at $($script:VSInstall.InstallationPath)"
 }
 
 # GPU detection (CUDA only on Windows)
@@ -488,6 +527,9 @@ if ($needsWhisper) {
         if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force -ErrorAction SilentlyContinue }
 
         $cmakeArgs = @("-B", $buildDir, "-S", $WHISPER_DIR, "-DCMAKE_BUILD_TYPE=Release")
+        # Pick the matching VS generator so CMake locates MSVC via vswhere itself,
+        # without needing cl.exe on PATH (which it never is outside a Dev Prompt).
+        if ($script:VSGenerator) { $cmakeArgs += @("-G", $script:VSGenerator, "-A", "x64") }
         if ($UseGpu -and $GPU_BUILD) { $cmakeArgs += $GPU_BUILD }
 
         Write-Info ("Configuring whisper.cpp (" + $(if ($UseGpu -and $GPU_BUILD) { "GPU" } else { "CPU" }) + ")...")
