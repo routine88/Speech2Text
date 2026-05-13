@@ -374,6 +374,36 @@ if ($nvidiaSmi) {
             Write-Ok "NVIDIA GPU: $gpuName"
 
             $nvccPath = Find-Nvcc
+            if (-not $nvccPath -and $hasWinget) {
+                # PyTorch CUDA wheels work on the driver alone, but whisper.cpp's
+                # GGML_CUDA backend requires the toolkit (nvcc) at build time.
+                # If we skip this and just build CPU-only, transcription is slow
+                # and the user thinks the GPU isn't being used at all -- because
+                # transcription dominates total time. Offer to install the toolkit.
+                Write-Warn "CUDA Toolkit (nvcc) not found -- needed to GPU-accelerate transcription."
+                Write-Host ""
+                Write-Host "  Install CUDA Toolkit now? Downloads ~3 GB, takes 5-10 min." -ForegroundColor Yellow
+                Write-Host "  Without it, Whisper transcription runs on CPU (much slower)." -ForegroundColor Yellow
+                $reply = Read-Host "  Install? [Y/n]"
+                if ($reply -eq '' -or $reply -match '^[Yy]') {
+                    Write-Info "Installing CUDA Toolkit via winget (this may take a while)..."
+                    winget install --id Nvidia.CUDA `
+                        --accept-source-agreements --accept-package-agreements -e 2>&1 | Out-Host
+                    # winget often doesn't propagate PATH to the current session,
+                    # but Find-Nvcc probes the standard install root directly.
+                    $nvccPath = Find-Nvcc
+                    if ($nvccPath) {
+                        Write-Ok "CUDA Toolkit installed."
+                    } else {
+                        Write-Warn "CUDA Toolkit install did not register in this session."
+                        Write-Warn "Reboot and rerun launch.bat to enable GPU transcription."
+                    }
+                } else {
+                    Write-Warn "Skipping. Whisper will build CPU-only."
+                    Write-Warn "To enable later: winget install Nvidia.CUDA  (then rerun launch.bat)"
+                }
+            }
+
             if ($nvccPath) {
                 $nvccOut = & $nvccPath --version 2>&1
                 $cudaVer = ""
@@ -386,9 +416,7 @@ if ($nvidiaSmi) {
                 $GPU_BUILD = "-DGGML_CUDA=ON"
                 Write-Ok "CUDA Toolkit: $cudaVer (GPU build enabled)"
             } else {
-                Write-Warn "CUDA Toolkit (nvcc) not found -- whisper.cpp will build for CPU."
-                Write-Warn "PyTorch will still use the GPU. To enable GPU in whisper.cpp later:"
-                Write-Warn "  winget install Nvidia.CUDA  (then rerun launch.bat)"
+                Write-Warn "Building whisper.cpp for CPU. PyTorch will still use the GPU."
             }
         }
     } catch {}
@@ -428,7 +456,17 @@ if (-not (Test-Path $WHISPER_DIR)) {
 } elseif (Test-Path (Join-Path $WHISPER_DIR ".git")) {
     $whisperHead = git -C $WHISPER_DIR rev-parse HEAD 2>$null
     $buildMarker = Join-Path $STATE_DIR "whisper_build"
-    if (-not (Test-Path $buildMarker) -or (Get-Content $buildMarker -ErrorAction SilentlyContinue) -ne $whisperHead) {
+    # Composite key: git HEAD + GPU build flags. If the user installed the CUDA
+    # Toolkit since the last run, we must rebuild even though the source hash
+    # is unchanged -- otherwise they keep using the CPU-only binary.
+    $buildKey = "$whisperHead|$GPU_BUILD"
+    $existingMarker = Get-Content $buildMarker -ErrorAction SilentlyContinue
+    # Migrate legacy marker format (just "<HEAD>") to "<HEAD>|" so an existing
+    # CPU-only build doesn't trigger a spurious rebuild on first run after upgrade.
+    if ($existingMarker -and $existingMarker -notmatch '\|') {
+        $existingMarker = "$existingMarker|"
+    }
+    if (-not $existingMarker -or $existingMarker -ne $buildKey) {
         $needsWhisper = $true
     }
 }
@@ -567,8 +605,9 @@ if ($needsWhisper) {
 
     if ($built) {
         $newHead = git -C $WHISPER_DIR rev-parse HEAD 2>$null
-        Set-Content -Path (Join-Path $STATE_DIR "whisper_build") -Value $newHead
-        Write-Ok "whisper.cpp built"
+        # Keep marker format in sync with the comparison above.
+        Set-Content -Path (Join-Path $STATE_DIR "whisper_build") -Value "$newHead|$GPU_BUILD"
+        Write-Ok "whisper.cpp built ($(if ($GPU_BUILD) { 'GPU' } else { 'CPU' }))"
     } else {
         Write-Err "whisper.cpp build failed even with CPU fallback."
         Write-Err "You may need Visual Studio Build Tools with the C++ workload."
