@@ -19,6 +19,44 @@ $WHISPER_DIR = if ($env:WHISPER_DIR)         { $env:WHISPER_DIR }         else {
 $MODEL       = if ($env:WHISPER_MODEL_NAME)  { $env:WHISPER_MODEL_NAME }  else { "large-v3" }
 $SELF        = $MyInvocation.MyCommand.Path
 
+# ── Crash diagnostics ────────────────────────────────────────
+# Prevent the "double-click → red text → window vanishes" failure mode by
+# (1) logging everything to a transcript on disk, and (2) trapping any
+# uncaught error to pause before exit. launch.bat sets S2T_LAUNCHED_FROM_BAT,
+# which gives that wrapper a chance to `pause` on its own; if the env var is
+# absent, the .ps1 was run directly (e.g. right-click → Run with PowerShell)
+# and we must hold the window open ourselves.
+$script:LaunchedFromBat = ($env:S2T_LAUNCHED_FROM_BAT -eq "1")
+$script:TranscriptPath  = $null
+try {
+    # Use %TEMP% rather than $REPO_DIR — on first run the repo doesn't exist
+    # yet and pre-creating subdirs would make the upcoming `git clone` fail.
+    $logDir = Join-Path $env:TEMP "Speech2Text-launcher"
+    New-Item -ItemType Directory -Path $logDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $script:TranscriptPath = Join-Path $logDir ("launcher-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+    Start-Transcript -Path $script:TranscriptPath -Append -ErrorAction SilentlyContinue | Out-Null
+} catch { $script:TranscriptPath = $null }
+
+function Wait-OnExit {
+    param([string] $Reason = "")
+    if (-not $script:LaunchedFromBat) {
+        if ($Reason) { Write-Host "" ; Write-Host $Reason -ForegroundColor Yellow }
+        if ($script:TranscriptPath) { Write-Host "Full log: $script:TranscriptPath" -ForegroundColor DarkGray }
+        try { Read-Host "Press Enter to close this window" | Out-Null } catch {}
+    }
+}
+
+trap {
+    Write-Host ""
+    Write-Host "[X]  Unexpected error: $($_.Exception.Message)" -ForegroundColor Red
+    if ($_.ScriptStackTrace) {
+        Write-Host $_.ScriptStackTrace -ForegroundColor DarkRed
+    }
+    try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
+    Wait-OnExit "The launcher crashed. The log above has been saved."
+    exit 1
+}
+
 # ── Helpers ───────────────────────────────────────────────────
 function Write-Info  ($msg) { Write-Host "[.]  $msg" -ForegroundColor Cyan }
 function Write-Ok    ($msg) { Write-Host "[OK] $msg" -ForegroundColor Green }
