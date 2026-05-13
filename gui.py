@@ -18,7 +18,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, Gio, Gdk, GLib
 
-from config import WHISPER_CLI, WHISPER_MODEL, DEFAULT_OUTDIR
+from config import WHISPER_CLI, WHISPER_MODEL, DEFAULT_OUTDIR, GPU_TYPE, GPU_NAME
 
 ACCEPTED_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".wma", ".aac", ".opus", ".webm"}
 
@@ -63,14 +63,16 @@ def get_audio_duration(path: str) -> float:
 
 # ── Core pipeline ─────────────────────────────────────────────────────────────
 
-def run_whisper(wav_path, language, threads, log_fn):
+def run_whisper(wav_path, language, threads, log_fn, use_gpu=False):
     with tempfile.TemporaryDirectory() as tmpdir:
         out_base = os.path.join(tmpdir, "out")
         cmd = [
             str(WHISPER_CLI), "-m", str(WHISPER_MODEL),
             "-f", wav_path, "-t", str(threads),
-            "--no-gpu", "-oj", "-of", out_base, "-l", language,
+            "-oj", "-of", out_base, "-l", language,
         ]
+        if not use_gpu:
+            cmd.append("--no-gpu")
         log_fn(f"  Command: {' '.join(cmd[:6])}...")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -94,7 +96,7 @@ def _ts_to_seconds(ts):
     return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
 
 
-def run_diarization(wav_path, num_speakers, min_speakers, max_speakers, log_fn):
+def run_diarization(wav_path, num_speakers, min_speakers, max_speakers, log_fn, use_gpu=False):
     import warnings
     warnings.filterwarnings("ignore")
     import numpy as np
@@ -104,7 +106,9 @@ def run_diarization(wav_path, num_speakers, min_speakers, max_speakers, log_fn):
 
     log_fn("  Loading pyannote pipeline...")
     pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
-    pipeline.to(torch.device("cpu"))
+    device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
+    pipeline.to(device)
+    log_fn(f"  Diarization device: {device}")
 
     waveform, sample_rate = sf.read(wav_path)
     if waveform.ndim == 1:
@@ -184,6 +188,11 @@ class TranscribeWindow(Adw.ApplicationWindow):
                          default_width=820, default_height=750)
         self.running = False
         self.input_path = None
+        self.audio_duration = 0.0
+        self._etr_phase = ""
+        self._etr_phase_start = 0.0
+        self._etr_est_total = 0.0
+        self._etr_timer_id = None
         self._build_ui()
 
     def _build_ui(self):
@@ -301,6 +310,15 @@ class TranscribeWindow(Adw.ApplicationWindow):
         self.diarize_row.connect("notify::active", self._on_diarize_toggle)
         settings_group.add(self.diarize_row)
 
+        # GPU toggle
+        has_gpu = GPU_TYPE in ("cuda", "rocm")
+        gpu_label = GPU_TYPE.upper() if has_gpu else "not detected"
+        gpu_subtitle = f"{GPU_NAME} ({gpu_label})" if has_gpu else "No CUDA/ROCm GPU detected"
+        self.gpu_row = Adw.SwitchRow(title="GPU acceleration", subtitle=gpu_subtitle)
+        self.gpu_row.set_active(has_gpu)
+        self.gpu_row.set_sensitive(has_gpu)
+        settings_group.add(self.gpu_row)
+
         # Speaker settings group
         self.speaker_group = Adw.PreferencesGroup(title="Speaker Detection")
         content.append(self.speaker_group)
@@ -395,6 +413,10 @@ class TranscribeWindow(Adw.ApplicationWindow):
         self._log("Ready. Drop an audio file or click the input area to browse.")
         self._log(f"Model: {Path(WHISPER_MODEL).name}")
         self._log(f"Output folder: {DEFAULT_OUTDIR}")
+        if GPU_TYPE in ("cuda", "rocm"):
+            self._log(f"GPU: {GPU_NAME} ({GPU_TYPE.upper()})")
+        else:
+            self._log("GPU: None detected (using CPU)")
 
     # ── Drop handlers ─────────────────────────────────────────────────────
 
@@ -439,16 +461,27 @@ class TranscribeWindow(Adw.ApplicationWindow):
 
         try:
             dur = get_audio_duration(path)
+            self.audio_duration = dur
             m, s = divmod(dur, 60)
             h, m = divmod(m, 60)
             ts = f"{int(h):02d}:{int(m):02d}:{s:05.2f}"
             self.duration_label.set_text(ts)
-            est_minutes = dur * 0.4 / 60
+
+            use_gpu = self.gpu_row.get_active()
+            whisper_rate = 0.1 if use_gpu else 0.4
+            diarize_rate = 0.05 if use_gpu else 0.15
+            est_seconds = dur * whisper_rate
             if self.diarize_row.get_active():
-                est_minutes += dur * 0.15 / 60
+                est_seconds += dur * diarize_rate
+            est_minutes = est_seconds / 60
+
             self._log(f"Loaded: {name} ({ts})")
-            self._log(f"Estimated processing time: ~{max(1, int(est_minutes))} minutes")
+            if est_minutes < 1:
+                self._log(f"Estimated processing time: ~{max(1, int(est_seconds))}s")
+            else:
+                self._log(f"Estimated processing time: ~{max(1, int(est_minutes))} min")
         except Exception:
+            self.audio_duration = 0.0
             self.duration_label.set_text("")
 
     def _browse_input(self):
@@ -506,6 +539,46 @@ class TranscribeWindow(Adw.ApplicationWindow):
     def _log_thread(self, msg):
         GLib.idle_add(self._log, msg)
 
+    # ── ETR timer ─────────────────────────────────────────────────────────
+
+    def _etr_start(self, phase, est_seconds):
+        """Start the estimated time remaining ticker for a phase."""
+        self._etr_phase = phase
+        self._etr_phase_start = time.time()
+        self._etr_est_total = est_seconds
+        if self._etr_timer_id:
+            GLib.source_remove(self._etr_timer_id)
+        self._etr_timer_id = GLib.timeout_add(1000, self._etr_tick)
+        self._etr_tick()  # immediate first update
+
+    def _etr_tick(self):
+        if not self.running:
+            return False
+        elapsed = time.time() - self._etr_phase_start
+        remaining = max(0, self._etr_est_total - elapsed)
+        self.progress_label.set_text(
+            f"{self._etr_phase}  |  {self._fmt_duration(elapsed)} elapsed"
+            f"  |  ~{self._fmt_duration(remaining)} remaining"
+        )
+        return self.running  # keep ticking while running
+
+    def _etr_stop(self):
+        if self._etr_timer_id:
+            GLib.source_remove(self._etr_timer_id)
+            self._etr_timer_id = None
+
+    @staticmethod
+    def _fmt_duration(seconds):
+        """Format duration as human-readable string."""
+        s = int(seconds)
+        if s < 60:
+            return f"{s}s"
+        m, s = divmod(s, 60)
+        if m < 60:
+            return f"{m}m {s:02d}s"
+        h, m = divmod(m, 60)
+        return f"{h}h {m:02d}m"
+
     # ── Pipeline ──────────────────────────────────────────────────────────
 
     def _get_selected_format(self):
@@ -549,31 +622,46 @@ class TranscribeWindow(Adw.ApplicationWindow):
     def _run_pipeline(self, input_path, outdir):
         try:
             t_total = time.time()
+            use_gpu = self.gpu_row.get_active()
+            dur = self.audio_duration
+
+            # Processing rate estimates (multiplier of real-time)
+            whisper_rate = 0.1 if use_gpu else 0.4
+            diarize_rate = 0.05 if use_gpu else 0.15
 
             GLib.idle_add(self.progress_label.set_text, "Converting audio...")
             self._log_thread("Preparing audio (converting to 16kHz WAV)...")
+            if use_gpu:
+                self._log_thread(f"  GPU acceleration: enabled ({GPU_NAME})")
             wav_path = convert_to_wav(input_path)
 
             if not self.running:
                 self._finish("Cancelled.")
                 return
 
-            GLib.idle_add(self.progress_label.set_text, "Transcribing...")
-            self._log_thread("Transcribing with Whisper large-v3...")
+            # ── Transcription with ETR ────────────────────────────────────
+            est_whisper = dur * whisper_rate
+            self._log_thread(f"Transcribing with Whisper large-v3 (est. {self._fmt_duration(est_whisper)})...")
+            GLib.idle_add(self._etr_start, "Transcribing", est_whisper)
             t0 = time.time()
             threads = int(self.threads_row.get_value())
             language = self._get_selected_language()
-            segments = run_whisper(wav_path, language, threads, self._log_thread)
+            segments = run_whisper(wav_path, language, threads, self._log_thread, use_gpu=use_gpu)
             t_w = time.time() - t0
+            measured_whisper_rate = t_w / dur if dur > 0 else whisper_rate
+            GLib.idle_add(self._etr_stop)
             self._log_thread(f"  Transcription complete: {len(segments)} segments in {t_w:.1f}s")
 
             if not self.running:
                 self._finish("Cancelled.")
                 return
 
+            # ── Diarization with ETR ──────────────────────────────────────
             if self.diarize_row.get_active():
-                GLib.idle_add(self.progress_label.set_text, "Diarizing speakers...")
-                self._log_thread("Running speaker diarization...")
+                # Use measured whisper rate to refine diarization estimate
+                est_diarize = dur * diarize_rate
+                self._log_thread(f"Running speaker diarization (est. {self._fmt_duration(est_diarize)})...")
+                GLib.idle_add(self._etr_start, "Diarizing", est_diarize)
                 t0 = time.time()
 
                 num_spk = min_spk = max_spk = None
@@ -583,7 +671,9 @@ class TranscribeWindow(Adw.ApplicationWindow):
                     min_spk = int(self.min_speakers_spin.get_value())
                     max_spk = int(self.max_speakers_spin.get_value())
 
-                diarization = run_diarization(wav_path, num_spk, min_spk, max_spk, self._log_thread)
+                diarization = run_diarization(wav_path, num_spk, min_spk, max_spk,
+                                              self._log_thread, use_gpu=use_gpu)
+                GLib.idle_add(self._etr_stop)
                 t_d = time.time() - t0
                 speakers = set(d["speaker"] for d in diarization)
                 self._log_thread(f"  Diarization complete: {len(speakers)} speakers in {t_d:.1f}s")
@@ -626,6 +716,7 @@ class TranscribeWindow(Adw.ApplicationWindow):
     def _finish(self, error_msg):
         def _do():
             self.running = False
+            self._etr_stop()
             self.run_btn.set_sensitive(True)
             self.cancel_btn.set_sensitive(False)
             self.spinner.stop()

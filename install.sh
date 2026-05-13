@@ -37,16 +37,46 @@ if ! command -v git &>/dev/null; then
     exit 1
 fi
 
-# ── Check for ROCm (AMD GPU) ─────────────────────────────────────────────────
-HIP_BUILD=""
-if [ -d /opt/rocm ]; then
+# ── Detect GPU ────────────────────────────────────────────────────────────────
+GPU_BUILD=""
+TORCH_INDEX="https://download.pytorch.org/whl/cpu"
+GPU_TYPE="none"
+
+# Check CUDA (NVIDIA)
+if command -v nvidia-smi &>/dev/null; then
+    CUDA_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+    if [ -n "$GPU_NAME" ]; then
+        echo "  NVIDIA GPU detected: $GPU_NAME (driver $CUDA_VER)"
+        GPU_BUILD="-DGGML_CUDA=ON"
+        GPU_TYPE="cuda"
+        # Detect CUDA toolkit version for PyTorch wheel
+        NVCC_VER=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' || true)
+        if [[ "$NVCC_VER" == 12.* ]]; then
+            TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+            echo "  CUDA toolkit: $NVCC_VER (using cu124 PyTorch)"
+        elif [[ "$NVCC_VER" == 11.* ]]; then
+            TORCH_INDEX="https://download.pytorch.org/whl/cu118"
+            echo "  CUDA toolkit: $NVCC_VER (using cu118 PyTorch)"
+        else
+            echo "  CUDA toolkit not found via nvcc, using default PyTorch CUDA"
+            TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+        fi
+    fi
+fi
+
+# Check ROCm (AMD) — only if no CUDA
+if [ "$GPU_TYPE" = "none" ] && [ -d /opt/rocm ]; then
     echo "  ROCm detected at /opt/rocm"
-    # Check GPU arch
     GPU_ARCH=$(rocminfo 2>/dev/null | grep -oP 'gfx\d+' | head -1 || true)
     if [ -n "$GPU_ARCH" ]; then
         echo "  GPU architecture: $GPU_ARCH"
-        HIP_BUILD="-DGGML_HIP=ON -DAMDGPU_TARGETS=$GPU_ARCH -DCMAKE_PREFIX_PATH=/opt/rocm"
+        GPU_BUILD="-DGGML_HIP=ON -DAMDGPU_TARGETS=$GPU_ARCH -DCMAKE_PREFIX_PATH=/opt/rocm"
     fi
+fi
+
+if [ "$GPU_TYPE" = "none" ]; then
+    echo "  No GPU detected, using CPU only."
 fi
 
 # ── Create Python venv ───────────────────────────────────────────────────────
@@ -60,8 +90,8 @@ pip install --upgrade pip wheel setuptools -q
 echo "Installing Python dependencies..."
 pip install numpy soundfile PyGObject pycairo -q
 
-echo "Installing PyTorch (CPU)..."
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu -q
+echo "Installing PyTorch ($( [ "$GPU_TYPE" = "cuda" ] && echo "CUDA" || echo "CPU" ))..."
+pip install torch torchaudio --index-url "$TORCH_INDEX" -q
 
 echo "Installing pyannote-audio..."
 pip install pyannote.audio -q
@@ -78,7 +108,7 @@ fi
 
 echo "Building whisper.cpp..."
 cd "$WHISPER_DIR"
-cmake -B build $HIP_BUILD -DCMAKE_BUILD_TYPE=Release -q 2>&1 | tail -3
+cmake -B build $GPU_BUILD -DCMAKE_BUILD_TYPE=Release -q 2>&1 | tail -3
 cmake --build build -j$(nproc) --target whisper-cli 2>&1 | tail -3
 
 # ── Download model ───────────────────────────────────────────────────────────

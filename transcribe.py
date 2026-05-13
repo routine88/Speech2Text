@@ -29,7 +29,7 @@ import soundfile as sf
 import torch
 from pyannote.audio import Pipeline
 
-from config import WHISPER_CLI, WHISPER_MODEL
+from config import WHISPER_CLI, WHISPER_MODEL, GPU_TYPE, GPU_NAME
 
 
 def convert_to_wav(input_path: str) -> str:
@@ -49,7 +49,7 @@ def convert_to_wav(input_path: str) -> str:
     return tmp.name
 
 
-def run_whisper(wav_path: str, language: str, threads: int) -> list[dict]:
+def run_whisper(wav_path: str, language: str, threads: int, use_gpu: bool = False) -> list[dict]:
     """Run whisper.cpp and parse JSON output."""
     with tempfile.TemporaryDirectory() as tmpdir:
         out_base = os.path.join(tmpdir, "out")
@@ -58,11 +58,12 @@ def run_whisper(wav_path: str, language: str, threads: int) -> list[dict]:
             "-m", WHISPER_MODEL,
             "-f", wav_path,
             "-t", str(threads),
-            "--no-gpu",
             "-oj",
             "-of", out_base,
             "-l", language,
         ]
+        if not use_gpu:
+            cmd.append("--no-gpu")
 
         result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -99,10 +100,12 @@ def run_diarization(
     num_speakers: int | None,
     min_speakers: int | None,
     max_speakers: int | None,
+    use_gpu: bool = False,
 ) -> list[dict]:
     """Run pyannote speaker diarization."""
     pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
-    pipeline.to(torch.device("cpu"))
+    device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
+    pipeline.to(device)
 
     waveform, sample_rate = sf.read(wav_path)
     if waveform.ndim == 1:
@@ -199,18 +202,25 @@ def main():
     parser.add_argument("--max-speakers", type=int, help="Maximum number of speakers")
     parser.add_argument("-f", "--format", choices=["text", "json", "srt"], default="text", help="Output format (default: text)")
     parser.add_argument("-o", "--output", help="Output file (default: stdout)")
+    parser.add_argument("--no-gpu", action="store_true", help="Disable GPU acceleration")
     args = parser.parse_args()
 
     if not os.path.exists(args.audio):
         print(f"Error: {args.audio} not found", file=sys.stderr)
         sys.exit(1)
 
+    use_gpu = GPU_TYPE in ("cuda", "rocm") and not args.no_gpu
+    if use_gpu:
+        print(f"GPU: {GPU_NAME} ({GPU_TYPE.upper()})", file=sys.stderr)
+    else:
+        print("GPU: disabled (using CPU)", file=sys.stderr)
+
     print("Preparing audio...", file=sys.stderr)
     wav_path = convert_to_wav(args.audio)
 
     print("Transcribing with Whisper large-v3...", file=sys.stderr)
     t0 = time.time()
-    segments = run_whisper(wav_path, args.language, args.threads)
+    segments = run_whisper(wav_path, args.language, args.threads, use_gpu=use_gpu)
     t_whisper = time.time() - t0
     print(f"  Transcription: {t_whisper:.1f}s ({len(segments)} segments)", file=sys.stderr)
 
@@ -218,6 +228,7 @@ def main():
     t0 = time.time()
     diarization = run_diarization(
         wav_path, args.num_speakers, args.min_speakers, args.max_speakers,
+        use_gpu=use_gpu,
     )
     t_diarize = time.time() - t0
     speakers = set(d["speaker"] for d in diarization)

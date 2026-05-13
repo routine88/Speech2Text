@@ -6,6 +6,8 @@ Local speech-to-text transcription with speaker diarization (speaker identificat
 
 - **Whisper large-v3** via [whisper.cpp](https://github.com/ggerganov/whisper.cpp) for high-quality transcription
 - **Speaker diarization** via [pyannote-audio](https://github.com/pyannote/pyannote-audio) — identifies who said what
+- **CUDA GPU acceleration** — auto-detected; falls back to CPU gracefully
+- **Estimated time remaining** — live ETR counter during transcription and diarization
 - **GTK4 GUI** with native Wayland drag-and-drop support
 - **CLI** for scripting and batch processing
 - **100+ languages** supported (auto-detection available)
@@ -92,10 +94,17 @@ Paths can be overridden with environment variables:
 | `WHISPER_CLI` | `~/whisper.cpp/build/bin/whisper-cli` | Path to whisper-cli binary |
 | `WHISPER_MODEL` | `~/whisper.cpp/models/ggml-large-v3.bin` | Path to GGML model file |
 | `S2T_OUTPUT_DIR` | `~/transcripts` | Default output directory |
+| `S2T_USE_GPU` | auto | `1` to force GPU, `0` to force CPU |
+
+### GPU acceleration
+
+CUDA GPUs are auto-detected at startup. The installer builds whisper.cpp with CUDA support when `nvidia-smi` and the CUDA toolkit are found, and installs the CUDA-enabled PyTorch wheels. GPU acceleration is used for both whisper.cpp transcription and pyannote diarization.
+
+To force CPU mode: `./bin/transcribe audio.wav --no-gpu` (CLI) or toggle the GPU switch in the GUI.
 
 ## Performance
 
-Benchmarked on AMD Ryzen AI MAX+ 395 (32 threads, AVX-512):
+Benchmarked on AMD Ryzen AI MAX+ 395 (32 threads, AVX-512), CPU mode:
 
 | Audio length | Transcription | Diarization | Total |
 |---|---|---|---|
@@ -103,7 +112,9 @@ Benchmarked on AMD Ryzen AI MAX+ 395 (32 threads, AVX-512):
 | 1 hour (est.) | ~24 min | ~15 min | ~40 min |
 | 2 hours (est.) | ~48 min | ~30 min | ~1.5 hr |
 
-Performance scales roughly linearly with audio length. Uses CPU only — the Whisper large-v3 model requires ~3GB RAM.
+With a CUDA GPU, expect roughly 4-5x faster processing.
+
+Performance scales roughly linearly with audio length. The Whisper large-v3 model requires ~3GB RAM/VRAM.
 
 ## Output example
 
