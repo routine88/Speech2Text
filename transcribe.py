@@ -49,8 +49,41 @@ def convert_to_wav(input_path: str) -> str:
     return tmp.name
 
 
+def _try_faster_whisper(wav_path, language, threads, use_gpu):
+    """Try faster-whisper (CTranslate2). Returns segments or None on
+    unavailable / failure so the caller falls back to whisper.cpp."""
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        return None
+    try:
+        device = "cuda" if use_gpu else "cpu"
+        compute_type = "float16" if use_gpu else "int8"
+        print(f"faster-whisper: loading large-v3 (device={device}, compute={compute_type})", file=sys.stderr)
+        model = WhisperModel("large-v3", device=device, compute_type=compute_type, cpu_threads=threads)
+        segments_iter, _ = model.transcribe(
+            wav_path,
+            language=None if language in ("auto", "") else language,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        )
+        return [
+            {"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
+            for s in segments_iter
+        ]
+    except Exception as e:
+        print(f"faster-whisper failed: {e}; falling back to whisper.cpp", file=sys.stderr)
+        return None
+
+
 def run_whisper(wav_path: str, language: str, threads: int, use_gpu: bool = False) -> list[dict]:
-    """Run whisper.cpp and parse JSON output."""
+    """Transcribe via faster-whisper if available, else whisper.cpp."""
+    fw = _try_faster_whisper(wav_path, language, threads, use_gpu)
+    if fw is not None:
+        return fw
+
     with tempfile.TemporaryDirectory() as tmpdir:
         out_base = os.path.join(tmpdir, "out")
         cmd = [

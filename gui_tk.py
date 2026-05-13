@@ -102,7 +102,60 @@ def _ts_to_seconds(ts):
     return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
 
 
+def _try_faster_whisper(wav_path, language, threads, log_fn, use_gpu=False):
+    """Try transcribing with faster-whisper (CTranslate2). Returns a list of
+    segment dicts, or None if faster-whisper isn't installed or fails to
+    initialise -- in which case the caller falls back to whisper.cpp.
+
+    faster-whisper uses cuBLAS/tensor cores directly via CTranslate2, so it
+    matches reference Whisper accuracy and saturates the GPU much better than
+    whisper.cpp's ggml-cuda kernels. Built-in Silero VAD and proper
+    condition_on_previous_text=False (the equivalent of whisper.cpp's -mc 0)
+    eliminate the loop-hallucination failure mode.
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        log_fn("  faster-whisper not installed; using whisper.cpp backend")
+        return None
+    try:
+        device = "cuda" if use_gpu else "cpu"
+        compute_type = "float16" if use_gpu else "int8"
+        log_fn(f"  faster-whisper: loading large-v3 (device={device}, compute_type={compute_type})")
+        model = WhisperModel(
+            "large-v3", device=device, compute_type=compute_type,
+            cpu_threads=threads,
+        )
+        log_fn("  faster-whisper: transcribing (beam_size=5, VAD on)...")
+        segments_iter, info = model.transcribe(
+            wav_path,
+            language=None if language in ("auto", "") else language,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,  # equivalent of -mc 0
+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        )
+        segments = []
+        for seg in segments_iter:
+            segments.append({
+                "start": float(seg.start),
+                "end": float(seg.end),
+                "text": (seg.text or "").strip(),
+            })
+        return segments
+    except Exception as e:
+        log_fn(f"  faster-whisper failed: {e}")
+        log_fn("  Falling back to whisper.cpp backend.")
+        return None
+
+
 def run_whisper(wav_path, language, threads, log_fn, use_gpu=False):
+    # Preferred: faster-whisper (CTranslate2). Fall through to whisper.cpp
+    # if the package isn't installed or the GPU init fails.
+    result = _try_faster_whisper(wav_path, language, threads, log_fn, use_gpu)
+    if result is not None:
+        return result
+
     with tempfile.TemporaryDirectory() as tmpdir:
         out_base = os.path.join(tmpdir, "out")
         cmd = [
