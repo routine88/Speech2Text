@@ -423,10 +423,24 @@ if ($nvidiaSmi) {
             if ($nvccPath) {
                 $nvccOut = & $nvccPath --version 2>&1
                 $cudaVer = ""
-                if ($nvccOut -match "release (\d+\.\d+)") {
-                    $cudaVer = $Matches[1]
-                    if ($cudaVer -like "11.*") {
+                if ($nvccOut -match "release (\d+)\.(\d+)") {
+                    $cudaMajor = [int]$Matches[1]
+                    $cudaMinor = [int]$Matches[2]
+                    $cudaVer = "$cudaMajor.$cudaMinor"
+                    # Map CUDA Toolkit version -> PyTorch wheel index.
+                    # cu128 is the lowest currently-published index with
+                    # Blackwell (sm_120) support, so we default new toolkits
+                    # to it. cu124 wheels do NOT include sm_120 kernels --
+                    # using them on a 50xx card silently disables CUDA.
+                    if ($cudaMajor -eq 11) {
                         $TORCH_INDEX = "https://download.pytorch.org/whl/cu118"
+                    } elseif ($cudaMajor -eq 12 -and $cudaMinor -le 4) {
+                        $TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
+                    } elseif ($cudaMajor -eq 12 -and $cudaMinor -le 6) {
+                        $TORCH_INDEX = "https://download.pytorch.org/whl/cu126"
+                    } else {
+                        # CUDA 12.7+, 13.x, or anything newer -- use cu128.
+                        $TORCH_INDEX = "https://download.pytorch.org/whl/cu128"
                     }
                 }
                 $GPU_BUILD = "-DGGML_CUDA=ON"
@@ -472,7 +486,7 @@ if (-not (Test-Path $venvMarker) -or -not (Test-Path $activateScript)) {
 }
 
 # Pip deps (no PyGObject on Windows)
-$depString = "setuptools<82 numpy soundfile torch torchaudio pyannote.audio tkinterdnd2|$TORCH_INDEX"
+$depString = "setuptools<82 numpy soundfile torch torchaudio pyannote.audio tkinterdnd2 cuda-index-v2|$TORCH_INDEX"
 $depHash = (Get-FileHash -InputStream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($depString))) -Algorithm SHA256).Hash
 $pipMarker = Join-Path $STATE_DIR "pip_deps"
 if (-not (Test-Path $pipMarker) -or (Get-Content $pipMarker -ErrorAction SilentlyContinue) -ne $depHash) {
@@ -550,21 +564,27 @@ if ($needsPip) {
     Invoke-Pip install --upgrade pip
     if ($LASTEXITCODE -ne 0) { Write-Warn "pip self-upgrade failed; continuing with existing pip" }
 
-    # Install everything in one resolver pass. Doing torch / pyannote / numpy
-    # in separate calls makes pip re-evaluate constraints each time, which can
-    # uninstall and reinstall the same exact version when pyannote's
-    # dependency closure intersects with torch's. PyPI is the default index;
-    # --extra-index-url adds the CUDA wheel server so `torch` resolves to e.g.
-    # 2.x.y+cu124 (which sorts higher than the plain 2.x.y on PyPI) without
-    # making the second index primary (which would break non-torch packages).
-    #
-    # `setuptools<82` matches torch 2.12.x's own constraint -- explicitly
-    # including it here forces pip's resolver to downgrade any user who got
-    # stuck on 82.0.1 from an earlier launcher version that bumped it.
-    Invoke-Pip install --extra-index-url $TORCH_INDEX `
-        "setuptools<82" numpy soundfile torch torchaudio pyannote.audio
+    # Pass 1: install torch + torchaudio from the CUDA wheel index ONLY.
+    # We use --index-url (not --extra-index-url) here so pip can't also see
+    # PyPI's plain (CPU) torch and pick it because its bare version sorts
+    # higher than e.g. 2.6.0+cu128. --upgrade ensures any previously-installed
+    # CPU torch is replaced with the CUDA build. This is the bug that left
+    # pyannote running on CPU even when whisper.cpp had a working GPU build.
+    Invoke-Pip install --index-url $TORCH_INDEX --upgrade torch torchaudio
     if ($LASTEXITCODE -ne 0) {
-        Write-Err "Failed to install core Python packages (numpy/soundfile/torch/pyannote)"
+        Write-Err "Failed to install torch/torchaudio from $TORCH_INDEX"
+        Read-Host "Press Enter to exit"; exit 1
+    }
+
+    # Pass 2: everything else from PyPI. --extra-index-url keeps the CUDA
+    # wheel server visible so any torch sub-dep can still resolve there, but
+    # torch itself is already installed (with the cu* suffix) and pip won't
+    # touch it. `setuptools<82` matches torch's own constraint and downgrades
+    # any user stuck on 82.0.1 from an earlier launcher.
+    Invoke-Pip install --extra-index-url $TORCH_INDEX `
+        "setuptools<82" numpy soundfile pyannote.audio
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to install core Python packages (numpy/soundfile/pyannote)"
         Read-Host "Press Enter to exit"; exit 1
     }
 

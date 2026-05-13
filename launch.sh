@@ -97,13 +97,6 @@ if command -v nvidia-smi &>/dev/null; then
     if [ -n "$GPU_NAME" ]; then
         GPU_TYPE="cuda"
         NVCC_VER=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' || true)
-        if [[ "$NVCC_VER" == 12.* ]]; then
-            TORCH_INDEX="https://download.pytorch.org/whl/cu124"
-        elif [[ "$NVCC_VER" == 11.* ]]; then
-            TORCH_INDEX="https://download.pytorch.org/whl/cu118"
-        else
-            TORCH_INDEX="https://download.pytorch.org/whl/cu124"
-        fi
         if [ -n "$NVCC_VER" ]; then
             GPU_BUILD="-DGGML_CUDA=ON"
             # Pin to this GPU's compute capability. Without it CMake builds for
@@ -113,6 +106,18 @@ if command -v nvidia-smi &>/dev/null; then
             if [[ "$CC_RAW" =~ ^[[:space:]]*([0-9]+)\.([0-9]+) ]]; then
                 CUDA_ARCH="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
                 GPU_BUILD="$GPU_BUILD -DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH"
+            fi
+            # Map CUDA toolkit -> torch wheel index. cu128 is the lowest index
+            # currently published with Blackwell (sm_120) support, so anything
+            # 12.7+/13.x goes there. cu124 wheels do NOT include sm_120 kernels.
+            if [[ "$NVCC_VER" =~ ^11\. ]]; then
+                TORCH_INDEX="https://download.pytorch.org/whl/cu118"
+            elif [[ "$NVCC_VER" =~ ^12\.([0-4])$ ]]; then
+                TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+            elif [[ "$NVCC_VER" =~ ^12\.([5-6])$ ]]; then
+                TORCH_INDEX="https://download.pytorch.org/whl/cu126"
+            else
+                TORCH_INDEX="https://download.pytorch.org/whl/cu128"
             fi
         else
             warn "CUDA Toolkit (nvcc) not found — whisper.cpp will build for CPU."
@@ -139,7 +144,7 @@ elif [ "$(cat "$STATE_DIR/venv" 2>/dev/null)" != "$PYTHON_VER" ]; then
 fi
 
 # Pip deps
-DEP_STRING="setuptools<82 numpy soundfile PyGObject pycairo torch torchaudio pyannote.audio tkinterdnd2|$TORCH_INDEX"
+DEP_STRING="setuptools<82 numpy soundfile PyGObject pycairo torch torchaudio pyannote.audio tkinterdnd2 cuda-index-v2|$TORCH_INDEX"
 DEP_HASH=$(echo "$DEP_STRING" | sha256sum | cut -d' ' -f1)
 if [ ! -f "$STATE_DIR/pip_deps" ] || [ "$(cat "$STATE_DIR/pip_deps" 2>/dev/null)" != "$DEP_HASH" ]; then
     needs_pip=1
@@ -225,8 +230,17 @@ if [ $needs_pip -eq 1 ]; then
     # `setuptools<82` matches torch 2.12.x's own constraint -- explicitly
     # including it here forces pip to downgrade any user who got stuck on
     # 82.0.1 from an earlier launcher that upgraded setuptools unconditionally.
+    #
+    # Pass 1: torch + torchaudio from the CUDA wheel index only (--index-url,
+    # not --extra-index-url). Otherwise pip can see PyPI's plain torch, find
+    # that its bare version sorts higher than e.g. 2.6.0+cu128, and install
+    # the CPU build instead -- which silently disables GPU diarization.
+    pip_install --index-url "$TORCH_INDEX" -q --upgrade torch torchaudio \
+        || { err "Failed to install torch/torchaudio from $TORCH_INDEX"; exit 1; }
+    # Pass 2: everything else from PyPI. torch is already satisfied so nothing
+    # touches it.
     pip_install --extra-index-url "$TORCH_INDEX" -q \
-        "setuptools<82" numpy soundfile torch torchaudio pyannote.audio \
+        "setuptools<82" numpy soundfile pyannote.audio \
         || { err "Failed to install core Python packages"; exit 1; }
     # PyGObject deps (Linux GUI) — soft-fail since CLI still works without it.
     # Kept separate so it can fail cleanly on systems without the system libs.
