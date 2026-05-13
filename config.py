@@ -15,7 +15,13 @@ import subprocess
 from pathlib import Path
 
 if platform.system() == "Windows":
-    _default_cli = Path.home() / "whisper.cpp" / "build" / "bin" / "Release" / "whisper-cli.exe"
+    # Multi-config (VS) generator emits to bin/Release/; single-config (Ninja)
+    # to bin/. Prefer whichever exists, else fall back to the VS-style path for
+    # error messages.
+    _bin = Path.home() / "whisper.cpp" / "build" / "bin"
+    _vs_cli = _bin / "Release" / "whisper-cli.exe"
+    _ninja_cli = _bin / "whisper-cli.exe"
+    _default_cli = _vs_cli if _vs_cli.exists() else (_ninja_cli if _ninja_cli.exists() else _vs_cli)
 else:
     _default_cli = Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"
 
