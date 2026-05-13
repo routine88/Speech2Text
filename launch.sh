@@ -106,6 +106,14 @@ if command -v nvidia-smi &>/dev/null; then
         fi
         if [ -n "$NVCC_VER" ]; then
             GPU_BUILD="-DGGML_CUDA=ON"
+            # Pin to this GPU's compute capability. Without it CMake builds for
+            # every arch in its default list (sm_50..sm_90), so nvcc recompiles
+            # each kernel for every arch -- dominates build time.
+            CC_RAW=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || true)
+            if [[ "$CC_RAW" =~ ^[[:space:]]*([0-9]+)\.([0-9]+) ]]; then
+                CUDA_ARCH="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+                GPU_BUILD="$GPU_BUILD -DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH"
+            fi
         else
             warn "CUDA Toolkit (nvcc) not found — whisper.cpp will build for CPU."
             warn "PyTorch will still use the GPU. To enable GPU in whisper.cpp later,"

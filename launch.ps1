@@ -430,7 +430,23 @@ if ($nvidiaSmi) {
                     }
                 }
                 $GPU_BUILD = "-DGGML_CUDA=ON"
-                Write-Ok "CUDA Toolkit: $cudaVer (GPU build enabled)"
+                # Detect compute capability so we can pin CMAKE_CUDA_ARCHITECTURES
+                # to just this GPU. CMake's default list spans sm_50..sm_90, so
+                # nvcc would otherwise compile every kernel ~9 times -- dominating
+                # build time on a single-threaded MSBuild path.
+                $script:CudaArch = $null
+                try {
+                    $cap = & $nvidiaSmi --query-gpu=compute_cap --format=csv,noheader 2>$null |
+                           Select-Object -First 1
+                    if ($cap -and $cap -match '^\s*(\d+)\.(\d+)') {
+                        $script:CudaArch = "$($Matches[1])$($Matches[2])"
+                    }
+                } catch {}
+                if ($script:CudaArch) {
+                    Write-Ok "CUDA Toolkit: $cudaVer (GPU build, compute capability $script:CudaArch)"
+                } else {
+                    Write-Ok "CUDA Toolkit: $cudaVer (GPU build enabled)"
+                }
             } else {
                 Write-Warn "Building whisper.cpp for CPU. PyTorch will still use the GPU."
             }
@@ -590,7 +606,16 @@ if ($needsWhisper) {
         # Pick the matching VS generator so CMake locates MSVC via vswhere itself,
         # without needing cl.exe on PATH (which it never is outside a Dev Prompt).
         if ($script:VSGenerator) { $cmakeArgs += @("-G", $script:VSGenerator, "-A", "x64") }
-        if ($UseGpu -and $GPU_BUILD) { $cmakeArgs += $GPU_BUILD }
+        if ($UseGpu -and $GPU_BUILD) {
+            $cmakeArgs += $GPU_BUILD
+            # Pin to the user's actual GPU compute capability. Without this,
+            # CMake builds for every arch in its default list (sm_50..sm_90),
+            # so nvcc compiles each ggml-cuda kernel ~9 times. With a single
+            # arch it's roughly that much faster.
+            if ($script:CudaArch) {
+                $cmakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=$script:CudaArch"
+            }
+        }
 
         Write-Info ("Configuring whisper.cpp (" + $(if ($UseGpu -and $GPU_BUILD) { "GPU" } else { "CPU" }) + ")...")
         & cmake @cmakeArgs *>&1 | Tee-Object -FilePath $cfgLog | Out-Null
@@ -602,7 +627,12 @@ if ($needsWhisper) {
         }
 
         Write-Info "Building whisper.cpp (this may take a few minutes)..."
-        & cmake --build $buildDir --config Release --target whisper-cli *>&1 |
+        # `--parallel` lets the underlying generator use all cores. On the
+        # Visual Studio generator that becomes `msbuild /m`, which parallelises
+        # both the C++ and CUDA compilation paths. Without it MSBuild defaults
+        # to serial -- which is what made an earlier user's build look hung
+        # at 15% CPU.
+        & cmake --build $buildDir --config Release --target whisper-cli --parallel *>&1 |
             Tee-Object -FilePath $bldLog | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $whisperCliPath)) {
             Write-Err "CMake build failed (exit $LASTEXITCODE). Last lines:"
