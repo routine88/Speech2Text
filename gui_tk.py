@@ -13,6 +13,7 @@ importing this module never pulls in `gi` (which gui.py does at top level).
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,20 @@ from config import (
     WHISPER_CLI,
     WHISPER_MODEL,
 )
+
+# Drag-and-drop is optional. tkinterdnd2 ships a tcl/tk extension (tkdnd) plus
+# a TkinterDnD.Tk subclass that adds drop_target_register / dnd_bind. If the
+# package is missing we silently fall back to plain tk.Tk and the user can
+# still pick files via the Browse button.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore[import-not-found]
+
+    _RootTk = TkinterDnD.Tk
+    _HAS_DND = True
+except Exception:
+    _RootTk = tk.Tk
+    DND_FILES = None  # sentinel; never used when _HAS_DND is False
+    _HAS_DND = False
 
 
 ACCEPTED_EXTENSIONS = (
@@ -235,12 +250,12 @@ def _set_subtree_state(widget, state):
 
 # -- GUI ------------------------------------------------------------------
 
-class TranscribeApp(tk.Tk):
+class TranscribeApp(_RootTk):
     def __init__(self):
         super().__init__()
         self.title("Speech2Text - Whisper + Diarization")
-        self.geometry("820x740")
-        self.minsize(680, 600)
+        self.geometry("820x780")
+        self.minsize(680, 620)
 
         self.input_path = None
         self.audio_duration = 0.0
@@ -249,15 +264,24 @@ class TranscribeApp(tk.Tk):
         self._etr_phase_start = 0.0
         self._etr_est_total = 0.0
         self._etr_after_id = None
+        self._gpu_after_id = None
 
         self._build_ui()
-        self._log("Ready. Click Browse to select an audio file.")
+        if _HAS_DND:
+            self._enable_dnd()
+        self._log("Ready. " + (
+            "Drop a file anywhere on the window, or click Browse." if _HAS_DND
+            else "Click Browse to select an audio file."
+        ))
         self._log(f"Model: {Path(WHISPER_MODEL).name}")
         self._log(f"Output folder: {DEFAULT_OUTDIR}")
         if GPU_TYPE in ("cuda", "rocm"):
             self._log(f"GPU: {GPU_NAME} ({GPU_TYPE.upper()})")
         else:
             self._log("GPU: None detected (using CPU)")
+        if not _HAS_DND:
+            self._log("(Drag-and-drop not available -- pip install tkinterdnd2 to enable.)")
+        self._gpu_monitor_start()
 
     def _build_ui(self):
         main = ttk.Frame(self, padding=10)
@@ -273,9 +297,8 @@ class TranscribeApp(tk.Tk):
         in_frame.columnconfigure(0, weight=1)
 
         self.file_var = tk.StringVar(value="(no file selected)")
-        ttk.Entry(in_frame, textvariable=self.file_var, state="readonly").grid(
-            row=0, column=0, sticky="ew", padx=(0, 6)
-        )
+        self.file_entry = ttk.Entry(in_frame, textvariable=self.file_var, state="readonly")
+        self.file_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ttk.Button(in_frame, text="Browse...", command=self._browse_input).grid(row=0, column=1)
 
         self.duration_var = tk.StringVar(value="")
@@ -403,6 +426,93 @@ class TranscribeApp(tk.Tk):
         log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")
         self.log_text["yscrollcommand"] = log_scroll.set
+
+        # ---- GPU status row (NVIDIA only) -------------------------------
+        self.gpu_status_var = tk.StringVar(value="")
+        gpu_row = ttk.Frame(main)
+        gpu_row.grid(row=10, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(gpu_row, textvariable=self.gpu_status_var, foreground="#888").pack(side="left")
+
+    # -- DnD -----------------------------------------------------------
+
+    def _enable_dnd(self):
+        # Register the whole window so dropping anywhere works, plus the file
+        # entry specifically so the cursor shows the right affordance there.
+        for widget in (self, self.file_entry):
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._on_dnd_drop)
+            except Exception:
+                pass
+
+    def _on_dnd_drop(self, event):
+        # event.data on Windows looks like: "{C:/Users/x/My Audio.wav}"
+        # On Linux/macOS without braces. tk.splitlist handles both.
+        try:
+            paths = self.tk.splitlist(event.data)
+        except tk.TclError:
+            paths = [event.data]
+        for raw in paths:
+            path = raw.strip().strip("{}")
+            if path and os.path.isfile(path):
+                ext = Path(path).suffix.lower()
+                if ext in ACCEPTED_EXTENSIONS:
+                    self._load_audio_file(path)
+                    return
+                self._log(f"Unsupported file extension: {ext}")
+                return
+
+    # -- GPU monitor ---------------------------------------------------
+
+    def _gpu_monitor_start(self):
+        # Only NVIDIA for now -- pyannote-side ROCm support exists but rocm-smi
+        # has a different output format and is rarer on consumer machines.
+        if GPU_TYPE != "cuda" or not shutil.which("nvidia-smi"):
+            return
+        self._gpu_monitor_tick()
+
+    def _gpu_monitor_tick(self):
+        try:
+            r = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True, text=True, timeout=2,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                line = r.stdout.strip().splitlines()[0]
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 3:
+                    util = parts[0]
+                    try:
+                        mem_used_gb = float(parts[1]) / 1024.0
+                        mem_total_gb = float(parts[2]) / 1024.0
+                        mem_text = f"{mem_used_gb:.1f}/{mem_total_gb:.1f} GB"
+                    except ValueError:
+                        mem_text = f"{parts[1]}/{parts[2]} MiB"
+                    power_text = ""
+                    if len(parts) >= 4 and parts[3] not in ("[N/A]", "[Not Supported]", ""):
+                        try:
+                            power_text = f"  |  {float(parts[3]):.0f} W"
+                        except ValueError:
+                            power_text = f"  |  {parts[3]} W"
+                    self.gpu_status_var.set(
+                        f"GPU: {util}% util  |  {mem_text}{power_text}"
+                    )
+        except Exception:
+            pass
+        self._gpu_after_id = self.after(2000, self._gpu_monitor_tick)
+
+    def destroy(self):
+        if self._gpu_after_id is not None:
+            try:
+                self.after_cancel(self._gpu_after_id)
+            except Exception:
+                pass
+        super().destroy()
 
     # -- UI helpers ----------------------------------------------------
 
