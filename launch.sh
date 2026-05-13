@@ -216,12 +216,15 @@ if [ $needs_pip -eq 1 ]; then
     if ! pip_install --upgrade pip wheel setuptools -q; then
         warn "pip self-upgrade failed; continuing with existing pip"
     fi
-    pip_install numpy soundfile -q || { err "Failed to install numpy/soundfile"; exit 1; }
-    # PyGObject deps (Linux GUI) — soft-fail since CLI still works without it
+    # Install core packages in one resolver pass so pip doesn't uninstall and
+    # reinstall the same versions when pyannote's deps overlap with torch's.
+    # --extra-index-url keeps PyPI primary while making CUDA wheels available.
+    pip_install --extra-index-url "$TORCH_INDEX" -q \
+        numpy soundfile torch torchaudio pyannote.audio \
+        || { err "Failed to install core Python packages"; exit 1; }
+    # PyGObject deps (Linux GUI) — soft-fail since CLI still works without it.
+    # Kept separate so it can fail cleanly on systems without the system libs.
     pip_install PyGObject pycairo -q 2>/dev/null || warn "PyGObject install failed (GUI may not work)"
-    pip_install torch torchaudio --index-url "$TORCH_INDEX" -q \
-        || { err "Failed to install torch/torchaudio from $TORCH_INDEX"; exit 1; }
-    pip_install pyannote.audio -q || { err "Failed to install pyannote.audio"; exit 1; }
     # Optional: drag-and-drop in the tkinter GUI. Soft-fail since the GTK GUI
     # is the default on Linux and doesn't need it.
     pip_install tkinterdnd2 -q 2>/dev/null \

@@ -546,23 +546,23 @@ if ($needsPip) {
     Invoke-Pip install --upgrade pip wheel setuptools
     if ($LASTEXITCODE -ne 0) { Write-Warn "pip self-upgrade failed; continuing with existing pip" }
 
-    Invoke-Pip install numpy soundfile
+    # Install everything in one resolver pass. Doing torch / pyannote / numpy
+    # in separate calls makes pip re-evaluate constraints each time, which can
+    # uninstall and reinstall the same exact version when pyannote's
+    # dependency closure intersects with torch's. PyPI is the default index;
+    # --extra-index-url adds the CUDA wheel server so `torch` resolves to e.g.
+    # 2.x.y+cu124 (which sorts higher than the plain 2.x.y on PyPI) without
+    # making the second index primary (which would break non-torch packages).
+    Invoke-Pip install --extra-index-url $TORCH_INDEX `
+        numpy soundfile torch torchaudio pyannote.audio
     if ($LASTEXITCODE -ne 0) {
-        Write-Err "Failed to install numpy/soundfile"
+        Write-Err "Failed to install core Python packages (numpy/soundfile/torch/pyannote)"
         Read-Host "Press Enter to exit"; exit 1
     }
-    Invoke-Pip install torch torchaudio --index-url $TORCH_INDEX
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "Failed to install torch/torchaudio from $TORCH_INDEX"
-        Read-Host "Press Enter to exit"; exit 1
-    }
-    Invoke-Pip install pyannote.audio
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "Failed to install pyannote.audio"
-        Read-Host "Press Enter to exit"; exit 1
-    }
+
     # Optional: enables drag-and-drop in the tkinter GUI. Soft-fail so a wheel
     # build issue on an exotic Python version doesn't block the whole launch.
+    # Kept separate so its failure doesn't poison the core install above.
     Invoke-Pip install tkinterdnd2
     if ($LASTEXITCODE -ne 0) {
         Write-Warn "tkinterdnd2 install failed; drag-and-drop in the GUI will be disabled"
