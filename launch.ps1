@@ -472,7 +472,7 @@ if (-not (Test-Path $venvMarker) -or -not (Test-Path $activateScript)) {
 }
 
 # Pip deps (no PyGObject on Windows)
-$depString = "numpy soundfile torch torchaudio pyannote.audio tkinterdnd2|$TORCH_INDEX"
+$depString = "setuptools<82 numpy soundfile torch torchaudio pyannote.audio tkinterdnd2|$TORCH_INDEX"
 $depHash = (Get-FileHash -InputStream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($depString))) -Algorithm SHA256).Hash
 $pipMarker = Join-Path $STATE_DIR "pip_deps"
 if (-not (Test-Path $pipMarker) -or (Get-Content $pipMarker -ErrorAction SilentlyContinue) -ne $depHash) {
@@ -543,7 +543,11 @@ if ($needsPip) {
     Write-Info "Installing Python packages (this may take a few minutes)..."
     # Upgrade pip via `python -m pip` -- `pip install --upgrade pip` is rejected
     # by modern pip with "To modify pip, please run the following command".
-    Invoke-Pip install --upgrade pip wheel setuptools
+    # We deliberately do NOT bump wheel/setuptools here: torch pins
+    # `setuptools<82`, and unconditionally upgrading setuptools to whatever's
+    # latest on PyPI breaks that constraint on every run. The venv ships with
+    # compatible versions; leave them alone.
+    Invoke-Pip install --upgrade pip
     if ($LASTEXITCODE -ne 0) { Write-Warn "pip self-upgrade failed; continuing with existing pip" }
 
     # Install everything in one resolver pass. Doing torch / pyannote / numpy
@@ -553,8 +557,12 @@ if ($needsPip) {
     # --extra-index-url adds the CUDA wheel server so `torch` resolves to e.g.
     # 2.x.y+cu124 (which sorts higher than the plain 2.x.y on PyPI) without
     # making the second index primary (which would break non-torch packages).
+    #
+    # `setuptools<82` matches torch 2.12.x's own constraint -- explicitly
+    # including it here forces pip's resolver to downgrade any user who got
+    # stuck on 82.0.1 from an earlier launcher version that bumped it.
     Invoke-Pip install --extra-index-url $TORCH_INDEX `
-        numpy soundfile torch torchaudio pyannote.audio
+        "setuptools<82" numpy soundfile torch torchaudio pyannote.audio
     if ($LASTEXITCODE -ne 0) {
         Write-Err "Failed to install core Python packages (numpy/soundfile/torch/pyannote)"
         Read-Host "Press Enter to exit"; exit 1

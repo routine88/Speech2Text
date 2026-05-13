@@ -139,7 +139,7 @@ elif [ "$(cat "$STATE_DIR/venv" 2>/dev/null)" != "$PYTHON_VER" ]; then
 fi
 
 # Pip deps
-DEP_STRING="numpy soundfile PyGObject pycairo torch torchaudio pyannote.audio tkinterdnd2|$TORCH_INDEX"
+DEP_STRING="setuptools<82 numpy soundfile PyGObject pycairo torch torchaudio pyannote.audio tkinterdnd2|$TORCH_INDEX"
 DEP_HASH=$(echo "$DEP_STRING" | sha256sum | cut -d' ' -f1)
 if [ ! -f "$STATE_DIR/pip_deps" ] || [ "$(cat "$STATE_DIR/pip_deps" 2>/dev/null)" != "$DEP_HASH" ]; then
     needs_pip=1
@@ -213,14 +213,20 @@ pip_install() { "$VENV_PYTHON" -m pip install "$@"; }
 # 3c: Pip deps
 if [ $needs_pip -eq 1 ]; then
     info "Installing Python packages (this may take a few minutes)..."
-    if ! pip_install --upgrade pip wheel setuptools -q; then
+    # Upgrade pip only. We deliberately do NOT bump wheel/setuptools here:
+    # torch pins `setuptools<82`, and unconditionally upgrading setuptools to
+    # whatever's latest on PyPI breaks that constraint on every run.
+    if ! pip_install --upgrade pip -q; then
         warn "pip self-upgrade failed; continuing with existing pip"
     fi
     # Install core packages in one resolver pass so pip doesn't uninstall and
     # reinstall the same versions when pyannote's deps overlap with torch's.
     # --extra-index-url keeps PyPI primary while making CUDA wheels available.
+    # `setuptools<82` matches torch 2.12.x's own constraint -- explicitly
+    # including it here forces pip to downgrade any user who got stuck on
+    # 82.0.1 from an earlier launcher that upgraded setuptools unconditionally.
     pip_install --extra-index-url "$TORCH_INDEX" -q \
-        numpy soundfile torch torchaudio pyannote.audio \
+        "setuptools<82" numpy soundfile torch torchaudio pyannote.audio \
         || { err "Failed to install core Python packages"; exit 1; }
     # PyGObject deps (Linux GUI) — soft-fail since CLI still works without it.
     # Kept separate so it can fail cleanly on systems without the system libs.
