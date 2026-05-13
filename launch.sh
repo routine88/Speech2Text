@@ -238,6 +238,7 @@ fi
 # ── Phase 4: Launch ───────────────────────────────────────────
 header "Launching Speech2Text"
 source "$VENV_DIR/bin/activate"
+pip install --upgrade pip -q 2>/dev/null
 # Pick up system paths for ffmpeg etc.
 [ -f /home/linuxbrew/.linuxbrew/bin/brew ] && eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv 2>/dev/null)" || true
 exec python3 "$REPO_DIR/gui.py" "$@"

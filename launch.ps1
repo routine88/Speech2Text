@@ -417,6 +417,7 @@ if (-not $anyWork) {
 # ── Phase 4: Launch ───────────────────────────────────────────
 Write-Header "Launching Speech2Text"
 & (Join-Path $VENV_DIR "Scripts\Activate.ps1")
+pip install --upgrade pip -q 2>$null
 
 # Choose GUI: gui_tk.py (tkinter, cross-platform) > gui.py (GTK4, Linux-only) > CLI
 $guiTk  = Join-Path $REPO_DIR "gui_tk.py"
