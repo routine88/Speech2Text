@@ -493,8 +493,17 @@ if (-not (Test-Path $pipMarker) -or (Get-Content $pipMarker -ErrorAction Silentl
     $needsPip = $true
 }
 
-# whisper.cpp
-$whisperCliPath = Join-Path $WHISPER_DIR "build\bin\Release\whisper-cli.exe"
+# whisper.cpp -- binary location depends on the generator. The VS multi-config
+# generator emits to bin/Release/, Ninja emits straight to bin/. Check both.
+function Find-WhisperCli {
+    $candidates = @(
+        (Join-Path $WHISPER_DIR "build\bin\Release\whisper-cli.exe"),
+        (Join-Path $WHISPER_DIR "build\bin\whisper-cli.exe")
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+    return $candidates[0]  # canonical expected path when nothing built yet
+}
+$whisperCliPath = Find-WhisperCli
 if (-not (Test-Path $WHISPER_DIR)) {
     $needsWhisper = $true
 } elseif (-not (Test-Path $whisperCliPath)) {
@@ -622,6 +631,48 @@ if ($needsWhisper) {
     $cfgLog   = Join-Path $logDir "cmake-configure.log"
     $bldLog   = Join-Path $logDir "cmake-build.log"
 
+    # Ninja support. The MSBuild integration that the VS generator needs for
+    # CUDA (the .props/.targets in <VS>\MSBuild\...\BuildCustomizations) is not
+    # installed in two common cases:
+    #   - VS 2019 + CUDA 13.x : CUDA 13 only ships integration for VS 2022.
+    #   - winget-installed CUDA: silent install often skips the VS integration
+    #     component.
+    # In both, cmake configure dies with "No CUDA toolset found." Ninja calls
+    # cl.exe + nvcc directly and bypasses MSBuild custom build, so it works
+    # regardless. We use Ninja for the GPU build and keep the VS generator for
+    # CPU (no MSBuild integration needed there, so no reason to change it).
+    function Find-Ninja {
+        if (Test-Command "ninja") { return (Get-Command "ninja").Source }
+        $candidates = @()
+        if ($script:VSInstall) {
+            $candidates += (Join-Path $script:VSInstall.InstallationPath `
+                "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe")
+        }
+        foreach ($c in $candidates) {
+            if ($c -and (Test-Path $c)) {
+                $env:Path = (Split-Path $c) + ";" + $env:Path
+                return $c
+            }
+        }
+        return $null
+    }
+
+    # Source vsdevcmd.bat into this PowerShell session so cl.exe, link.exe, and
+    # the Windows SDK paths are available -- without this Ninja can't drive the
+    # MSVC toolchain.
+    function Initialize-VsBuildEnv {
+        if (-not $script:VSInstall) { return $false }
+        $vsDevCmd = Join-Path $script:VSInstall.InstallationPath "Common7\Tools\VsDevCmd.bat"
+        if (-not (Test-Path $vsDevCmd)) { return $false }
+        cmd /c "`"$vsDevCmd`" -arch=x64 -host_arch=x64 -no_logo > nul && set" |
+            ForEach-Object {
+                if ($_ -match '^([^=]+)=(.*)$') {
+                    [System.Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+                }
+            }
+        return $true
+    }
+
     # Returns $true on success. On failure, prints tail of log and returns $false.
     # cmake config can fail (e.g. "CUDA Toolkit not found") and then `cmake --build`
     # produces a misleading MSB1009 -- so we MUST check exit code after configure.
@@ -630,10 +681,28 @@ if ($needsWhisper) {
         # Fresh configure each attempt -- CMakeCache.txt caches the previous failure.
         if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force -ErrorAction SilentlyContinue }
 
+        $useNinja = $false
+        if ($UseGpu -and $GPU_BUILD) {
+            $ninja = Find-Ninja
+            if ($ninja) {
+                if (Initialize-VsBuildEnv) {
+                    $useNinja = $true
+                } else {
+                    Write-Warn "Could not initialise VS build env; falling back to VS generator."
+                }
+            } else {
+                Write-Warn "Ninja not found; GPU build may fail if MSBuild CUDA integration is missing."
+            }
+        }
+
         $cmakeArgs = @("-B", $buildDir, "-S", $WHISPER_DIR, "-DCMAKE_BUILD_TYPE=Release")
-        # Pick the matching VS generator so CMake locates MSVC via vswhere itself,
-        # without needing cl.exe on PATH (which it never is outside a Dev Prompt).
-        if ($script:VSGenerator) { $cmakeArgs += @("-G", $script:VSGenerator, "-A", "x64") }
+        if ($useNinja) {
+            $cmakeArgs += "-G", "Ninja"
+        } elseif ($script:VSGenerator) {
+            # Pick the matching VS generator so CMake locates MSVC via vswhere itself,
+            # without needing cl.exe on PATH (which it never is outside a Dev Prompt).
+            $cmakeArgs += "-G", $script:VSGenerator, "-A", "x64"
+        }
         if ($UseGpu -and $GPU_BUILD) {
             $cmakeArgs += $GPU_BUILD
             # Pin to the user's actual GPU compute capability. Without this,
@@ -645,7 +714,9 @@ if ($needsWhisper) {
             }
         }
 
-        Write-Info ("Configuring whisper.cpp (" + $(if ($UseGpu -and $GPU_BUILD) { "GPU" } else { "CPU" }) + ")...")
+        $genLabel = if ($useNinja) { "Ninja" } else { "VS" }
+        $modeLabel = if ($UseGpu -and $GPU_BUILD) { "GPU" } else { "CPU" }
+        Write-Info "Configuring whisper.cpp ($modeLabel, $genLabel generator)..."
         & cmake @cmakeArgs *>&1 | Tee-Object -FilePath $cfgLog | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Write-Err "CMake configure failed (exit $LASTEXITCODE). Last lines:"
@@ -655,14 +726,15 @@ if ($needsWhisper) {
         }
 
         Write-Info "Building whisper.cpp (this may take a few minutes)..."
-        # `--parallel` lets the underlying generator use all cores. On the
-        # Visual Studio generator that becomes `msbuild /m`, which parallelises
-        # both the C++ and CUDA compilation paths. Without it MSBuild defaults
-        # to serial -- which is what made an earlier user's build look hung
-        # at 15% CPU.
+        # `--parallel` lets the underlying generator use all cores. On VS that
+        # becomes `msbuild /m`; on Ninja it's the default.
+        # `--config Release` is a no-op for Ninja (single-config) but required
+        # for the VS multi-config generator.
         & cmake --build $buildDir --config Release --target whisper-cli --parallel *>&1 |
             Tee-Object -FilePath $bldLog | Out-Null
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $whisperCliPath)) {
+        # Output binary location depends on generator (bin/Release/ vs bin/).
+        $script:whisperCliPath = Find-WhisperCli
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $script:whisperCliPath)) {
             Write-Err "CMake build failed (exit $LASTEXITCODE). Last lines:"
             Get-Content $bldLog -Tail 20 | ForEach-Object { Write-Host "    $_" }
             Write-Info "Full log: $bldLog"
