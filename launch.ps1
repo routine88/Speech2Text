@@ -1,7 +1,7 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Speech2Text — One-Click Launcher (Windows)
+    Speech2Text -- One-Click Launcher (Windows)
     https://github.com/routine88/Speech2Text
 
 .DESCRIPTION
@@ -19,7 +19,45 @@ $WHISPER_DIR = if ($env:WHISPER_DIR)         { $env:WHISPER_DIR }         else {
 $MODEL       = if ($env:WHISPER_MODEL_NAME)  { $env:WHISPER_MODEL_NAME }  else { "large-v3" }
 $SELF        = $MyInvocation.MyCommand.Path
 
-# ── Helpers ───────────────────────────────────────────────────
+# -- Crash diagnostics ----------------------------------------
+# Prevent the "double-click -> red text -> window vanishes" failure mode by
+# (1) logging everything to a transcript on disk, and (2) trapping any
+# uncaught error to pause before exit. launch.bat sets S2T_LAUNCHED_FROM_BAT,
+# which gives that wrapper a chance to `pause` on its own; if the env var is
+# absent, the .ps1 was run directly (e.g. right-click -> Run with PowerShell)
+# and we must hold the window open ourselves.
+$script:LaunchedFromBat = ($env:S2T_LAUNCHED_FROM_BAT -eq "1")
+$script:TranscriptPath  = $null
+try {
+    # Use %TEMP% rather than $REPO_DIR -- on first run the repo doesn't exist
+    # yet and pre-creating subdirs would make the upcoming `git clone` fail.
+    $logDir = Join-Path $env:TEMP "Speech2Text-launcher"
+    New-Item -ItemType Directory -Path $logDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $script:TranscriptPath = Join-Path $logDir ("launcher-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+    Start-Transcript -Path $script:TranscriptPath -Append -ErrorAction SilentlyContinue | Out-Null
+} catch { $script:TranscriptPath = $null }
+
+function Wait-OnExit {
+    param([string] $Reason = "")
+    if (-not $script:LaunchedFromBat) {
+        if ($Reason) { Write-Host "" ; Write-Host $Reason -ForegroundColor Yellow }
+        if ($script:TranscriptPath) { Write-Host "Full log: $script:TranscriptPath" -ForegroundColor DarkGray }
+        try { Read-Host "Press Enter to close this window" | Out-Null } catch {}
+    }
+}
+
+trap {
+    Write-Host ""
+    Write-Host "[X]  Unexpected error: $($_.Exception.Message)" -ForegroundColor Red
+    if ($_.ScriptStackTrace) {
+        Write-Host $_.ScriptStackTrace -ForegroundColor DarkRed
+    }
+    try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
+    Wait-OnExit "The launcher crashed. The log above has been saved."
+    exit 1
+}
+
+# -- Helpers ---------------------------------------------------
 function Write-Info  ($msg) { Write-Host "[.]  $msg" -ForegroundColor Cyan }
 function Write-Ok    ($msg) { Write-Host "[OK] $msg" -ForegroundColor Green }
 function Write-Warn  ($msg) { Write-Host "[!]  $msg" -ForegroundColor Yellow }
@@ -41,7 +79,7 @@ function Invoke-Pip {
         throw "Venv python not found at '$script:VenvPython'. Create the venv first."
     }
     & $script:VenvPython -m pip @PipArgs
-    # Do not `return $LASTEXITCODE` — that would write the int to the pipeline.
+    # Do not `return $LASTEXITCODE` -- that would write the int to the pipeline.
     # Caller should check $LASTEXITCODE directly after this call.
 }
 
@@ -60,7 +98,7 @@ function Install-Winget($packageId, $name) {
     }
 }
 
-# ── Phase 0: Self-Update ─────────────────────────────────────
+# -- Phase 0: Self-Update -------------------------------------
 if ($env:S2T_SELF_UPDATED -ne "1" -and $SELF) {
     $tmp = [System.IO.Path]::GetTempFileName()
     try {
@@ -81,14 +119,14 @@ if ($env:S2T_SELF_UPDATED -ne "1" -and $SELF) {
     Remove-Item $tmp -ErrorAction SilentlyContinue
 }
 
-# ── Prerequisite: winget ──────────────────────────────────────
+# -- Prerequisite: winget --------------------------------------
 $hasWinget = Test-Command "winget"
 if (-not $hasWinget) {
     Write-Warn "winget not found. Will try to install dependencies manually."
     Write-Warn "For best experience, install App Installer from the Microsoft Store."
 }
 
-# ── Prerequisite: Git ─────────────────────────────────────────
+# -- Prerequisite: Git -----------------------------------------
 if (-not (Test-Command "git")) {
     Write-Header "Installing Git"
     if ($hasWinget) {
@@ -104,7 +142,7 @@ if (-not (Test-Command "git")) {
     }
 }
 
-# ── Phase 1: Repo Sync ───────────────────────────────────────
+# -- Phase 1: Repo Sync ---------------------------------------
 Write-Header "Syncing code"
 
 if (Test-Path (Join-Path $REPO_DIR ".git")) {
@@ -130,12 +168,12 @@ if ($SELF -and (Test-Path $repoLauncher)) {
     }
 }
 
-# ── Phase 2: State Check ─────────────────────────────────────
+# -- Phase 2: State Check -------------------------------------
 $STATE_DIR = Join-Path $REPO_DIR ".s2t_state"
 $VENV_DIR  = Join-Path $REPO_DIR "venv"
 New-Item -ItemType Directory -Path $STATE_DIR -Force | Out-Null
 
-# ── Auto-install system dependencies ─────────────────────────
+# -- Auto-install system dependencies -------------------------
 $needsRestart = $false
 
 # Python
@@ -211,7 +249,7 @@ if (-not (Test-Command "ffmpeg")) {
     }
 }
 
-# C++ Build Tools — check for cl.exe or Visual Studio
+# C++ Build Tools -- check for cl.exe or Visual Studio
 $hasCL = $false
 if (Test-Command "cl") { $hasCL = $true }
 if (-not $hasCL) {
@@ -254,7 +292,7 @@ if ($needsRestart) {
 }
 
 # GPU detection (CUDA only on Windows)
-# Note: PyTorch CUDA wheels work on the driver alone — no CUDA Toolkit needed.
+# Note: PyTorch CUDA wheels work on the driver alone -- no CUDA Toolkit needed.
 # But building whisper.cpp with -DGGML_CUDA=ON requires the CUDA Toolkit (nvcc).
 # So GPU torch wheels and GPU whisper build are gated independently.
 $GPU_BUILD = ""
@@ -268,7 +306,7 @@ if (Test-Command "nvidia-smi") {
     $nvidiaSmi = "C:\Windows\System32\nvidia-smi.exe"
 }
 
-# Locate nvcc — winget-installed CUDA isn't always on PATH, so probe common paths.
+# Locate nvcc -- winget-installed CUDA isn't always on PATH, so probe common paths.
 function Find-Nvcc {
     if (Test-Command "nvcc") { return (Get-Command "nvcc").Source }
     $candidates = @()
@@ -309,7 +347,7 @@ if ($nvidiaSmi) {
                 $GPU_BUILD = "-DGGML_CUDA=ON"
                 Write-Ok "CUDA Toolkit: $cudaVer (GPU build enabled)"
             } else {
-                Write-Warn "CUDA Toolkit (nvcc) not found — whisper.cpp will build for CPU."
+                Write-Warn "CUDA Toolkit (nvcc) not found -- whisper.cpp will build for CPU."
                 Write-Warn "PyTorch will still use the GPU. To enable GPU in whisper.cpp later:"
                 Write-Warn "  winget install Nvidia.CUDA  (then rerun launch.bat)"
             }
@@ -362,7 +400,7 @@ if (-not (Test-Path $modelPath)) {
     $needsModel = $true
 }
 
-# ── Phase 3: Install ─────────────────────────────────────────
+# -- Phase 3: Install -----------------------------------------
 $anyWork = $needsVenv -or $needsPip -or $needsWhisper -or $needsModel
 if ($anyWork) {
     Write-Header "Setting up project dependencies"
@@ -383,10 +421,10 @@ if ($needsVenv) {
     Write-Ok "Virtual environment created"
 }
 
-# Bind pip to the venv's python — must happen after venv exists, before any Invoke-Pip.
+# Bind pip to the venv's python -- must happen after venv exists, before any Invoke-Pip.
 $script:VenvPython = Join-Path $VENV_DIR "Scripts\python.exe"
 if (-not (Test-Path $script:VenvPython)) {
-    Write-Err "Venv python missing at $script:VenvPython — delete the venv folder and rerun."
+    Write-Err "Venv python missing at $script:VenvPython -- delete the venv folder and rerun."
     Read-Host "Press Enter to exit"
     exit 1
 }
@@ -394,7 +432,7 @@ if (-not (Test-Path $script:VenvPython)) {
 # 3b: Pip deps
 if ($needsPip) {
     Write-Info "Installing Python packages (this may take a few minutes)..."
-    # Upgrade pip via `python -m pip` — `pip install --upgrade pip` is rejected
+    # Upgrade pip via `python -m pip` -- `pip install --upgrade pip` is rejected
     # by modern pip with "To modify pip, please run the following command".
     Invoke-Pip install --upgrade pip wheel setuptools
     if ($LASTEXITCODE -ne 0) { Write-Warn "pip self-upgrade failed; continuing with existing pip" }
@@ -443,10 +481,10 @@ if ($needsWhisper) {
 
     # Returns $true on success. On failure, prints tail of log and returns $false.
     # cmake config can fail (e.g. "CUDA Toolkit not found") and then `cmake --build`
-    # produces a misleading MSB1009 — so we MUST check exit code after configure.
+    # produces a misleading MSB1009 -- so we MUST check exit code after configure.
     function Invoke-WhisperBuild {
         param([bool] $UseGpu)
-        # Fresh configure each attempt — CMakeCache.txt caches the previous failure.
+        # Fresh configure each attempt -- CMakeCache.txt caches the previous failure.
         if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force -ErrorAction SilentlyContinue }
 
         $cmakeArgs = @("-B", $buildDir, "-S", $WHISPER_DIR, "-DCMAKE_BUILD_TYPE=Release")
@@ -477,7 +515,7 @@ if ($needsWhisper) {
     if ($GPU_BUILD) {
         $built = Invoke-WhisperBuild -UseGpu $true
         if (-not $built) {
-            Write-Warn "GPU build failed — retrying with CPU build."
+            Write-Warn "GPU build failed -- retrying with CPU build."
             $GPU_BUILD = ""
             $built = Invoke-WhisperBuild -UseGpu $false
         }
@@ -552,7 +590,7 @@ if (-not $hfToken -or $hfToken -eq "") {
     Write-Host ""
     $hfInput = Read-Host "  Paste your HuggingFace token here (starts with hf_)"
     if ($hfInput) {
-        # Pass token via env var rather than string interpolation — avoids quoting bugs
+        # Pass token via env var rather than string interpolation -- avoids quoting bugs
         # if the token ever contains characters PowerShell would mangle.
         $env:S2T_HF_TOKEN = $hfInput
         & $script:VenvPython -c "import os; from huggingface_hub import login; login(token=os.environ['S2T_HF_TOKEN'])" 2>&1
@@ -588,7 +626,7 @@ except Exception as e:
     }
 }
 
-# ── Phase 4: Launch ───────────────────────────────────────────
+# -- Phase 4: Launch -------------------------------------------
 Write-Header "Launching Speech2Text"
 
 # Choose GUI: gui_tk.py (tkinter, cross-platform) > gui.py (GTK4, Linux-only) > CLI
