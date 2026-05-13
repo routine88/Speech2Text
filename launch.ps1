@@ -486,7 +486,7 @@ if (-not (Test-Path $venvMarker) -or -not (Test-Path $activateScript)) {
 }
 
 # Pip deps (no PyGObject on Windows)
-$depString = "setuptools<82 numpy soundfile torch torchaudio pyannote.audio tkinterdnd2 cuda-index-v2|$TORCH_INDEX"
+$depString = "setuptools<82 numpy soundfile torch torchaudio pyannote.audio tkinterdnd2 faster-whisper cuda-index-v2|$TORCH_INDEX"
 $depHash = (Get-FileHash -InputStream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($depString))) -Algorithm SHA256).Hash
 $pipMarker = Join-Path $STATE_DIR "pip_deps"
 if (-not (Test-Path $pipMarker) -or (Get-Content $pipMarker -ErrorAction SilentlyContinue) -ne $depHash) {
@@ -603,6 +603,15 @@ if ($needsPip) {
     Invoke-Pip install tkinterdnd2
     if ($LASTEXITCODE -ne 0) {
         Write-Warn "tkinterdnd2 install failed; drag-and-drop in the GUI will be disabled"
+    }
+
+    # Optional: faster-whisper (CTranslate2 backend). When present, the
+    # transcribe code path prefers it over whisper.cpp -- matches reference
+    # Whisper accuracy and saturates the GPU much better. Soft-fail so a
+    # broken install on this Python version still leaves whisper.cpp working.
+    Invoke-Pip install faster-whisper
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "faster-whisper install failed; will use whisper.cpp backend"
     }
     Set-Content -Path $pipMarker -Value $depHash
     Write-Ok "Python packages installed"

@@ -144,7 +144,7 @@ elif [ "$(cat "$STATE_DIR/venv" 2>/dev/null)" != "$PYTHON_VER" ]; then
 fi
 
 # Pip deps
-DEP_STRING="setuptools<82 numpy soundfile PyGObject pycairo torch torchaudio pyannote.audio tkinterdnd2 cuda-index-v2|$TORCH_INDEX"
+DEP_STRING="setuptools<82 numpy soundfile PyGObject pycairo torch torchaudio pyannote.audio tkinterdnd2 faster-whisper cuda-index-v2|$TORCH_INDEX"
 DEP_HASH=$(echo "$DEP_STRING" | sha256sum | cut -d' ' -f1)
 if [ ! -f "$STATE_DIR/pip_deps" ] || [ "$(cat "$STATE_DIR/pip_deps" 2>/dev/null)" != "$DEP_HASH" ]; then
     needs_pip=1
@@ -249,6 +249,10 @@ if [ $needs_pip -eq 1 ]; then
     # is the default on Linux and doesn't need it.
     pip_install tkinterdnd2 -q 2>/dev/null \
         || warn "tkinterdnd2 install failed (drag-and-drop in gui_tk.py will be disabled)"
+    # Optional: faster-whisper (CTranslate2). Preferred over whisper.cpp at
+    # runtime when present. Soft-fail keeps the whisper.cpp path working.
+    pip_install faster-whisper -q 2>/dev/null \
+        || warn "faster-whisper install failed (will use whisper.cpp backend)"
     echo "$DEP_HASH" > "$STATE_DIR/pip_deps"
     ok "Python packages installed"
 fi
