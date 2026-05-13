@@ -308,6 +308,19 @@ if ($needsModel) {
     Write-Ok "Model downloaded"
 }
 
+# 3f: VAD model (anti-hallucination)
+$vadModelPath = Join-Path $WHISPER_DIR "models\ggml-silero-v6.2.0.bin"
+if (-not (Test-Path $vadModelPath)) {
+    $vadUrl = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin"
+    Write-Info "Downloading VAD model (anti-hallucination)..."
+    try {
+        Invoke-WebRequest -Uri $vadUrl -OutFile $vadModelPath -UseBasicParsing
+        Write-Ok "VAD model downloaded"
+    } catch {
+        Write-Warn "Could not download VAD model. Transcription will work but without hallucination protection."
+    }
+}
+
 # Summary
 if (-not $anyWork) {
     Write-Ok "All dependencies up to date"

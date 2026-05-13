@@ -222,6 +222,14 @@ if [ $needs_model -eq 1 ]; then
     ok "Model downloaded"
 fi
 
+# 3f: VAD model (for anti-hallucination)
+VAD_MODEL_PATH="$WHISPER_DIR/models/ggml-silero-v6.2.0.bin"
+if [ ! -f "$VAD_MODEL_PATH" ] && [ -f "$WHISPER_DIR/models/download-vad-model.sh" ]; then
+    info "Downloading VAD model (anti-hallucination)..."
+    bash "$WHISPER_DIR/models/download-vad-model.sh" silero-v6.2.0
+    ok "VAD model downloaded"
+fi
+
 # Summary
 if [ $needs_venv -eq 0 ] && [ $needs_pip -eq 0 ] && [ $needs_whisper -eq 0 ] && [ $needs_model -eq 0 ] && [ $needs_syscheck -eq 0 ]; then
     ok "All dependencies up to date"

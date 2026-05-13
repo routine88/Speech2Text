@@ -26,6 +26,11 @@ WHISPER_MODEL = os.environ.get(
     str(Path.home() / "whisper.cpp" / "models" / "ggml-large-v3.bin"),
 )
 
+VAD_MODEL = os.environ.get(
+    "WHISPER_VAD_MODEL",
+    str(Path.home() / "whisper.cpp" / "models" / "ggml-silero-v6.2.0.bin"),
+)
+
 DEFAULT_OUTDIR = os.environ.get(
     "S2T_OUTPUT_DIR",
     str(Path.home() / "transcripts"),

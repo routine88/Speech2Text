@@ -18,7 +18,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, Gio, Gdk, GLib
 
-from config import WHISPER_CLI, WHISPER_MODEL, DEFAULT_OUTDIR, GPU_TYPE, GPU_NAME
+from config import WHISPER_CLI, WHISPER_MODEL, VAD_MODEL, DEFAULT_OUTDIR, GPU_TYPE, GPU_NAME
 
 ACCEPTED_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".wma", ".aac", ".opus", ".webm"}
 
@@ -70,7 +70,11 @@ def run_whisper(wav_path, language, threads, log_fn, use_gpu=False):
             str(WHISPER_CLI), "-m", str(WHISPER_MODEL),
             "-f", wav_path, "-t", str(threads),
             "-oj", "-of", out_base, "-l", language,
+            "--suppress-nst",
         ]
+        if os.path.isfile(VAD_MODEL):
+            cmd += ["--vad", "-vm", str(VAD_MODEL), "--vad-max-speech-duration-s", "30"]
+            log_fn("  VAD enabled (anti-hallucination)")
         if not use_gpu:
             cmd.append("--no-gpu")
         log_fn(f"  Command: {' '.join(cmd[:6])}...")

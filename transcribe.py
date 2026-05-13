@@ -29,7 +29,7 @@ import soundfile as sf
 import torch
 from pyannote.audio import Pipeline
 
-from config import WHISPER_CLI, WHISPER_MODEL, GPU_TYPE, GPU_NAME
+from config import WHISPER_CLI, WHISPER_MODEL, VAD_MODEL, GPU_TYPE, GPU_NAME
 
 
 def convert_to_wav(input_path: str) -> str:
@@ -61,7 +61,15 @@ def run_whisper(wav_path: str, language: str, threads: int, use_gpu: bool = Fals
             "-oj",
             "-of", out_base,
             "-l", language,
+            "--suppress-nst",             # suppress non-speech tokens
         ]
+        # Enable VAD to prevent hallucination loops on long audio
+        if os.path.isfile(VAD_MODEL):
+            cmd += [
+                "--vad",
+                "-vm", VAD_MODEL,
+                "--vad-max-speech-duration-s", "30",
+            ]
         if not use_gpu:
             cmd.append("--no-gpu")
 
