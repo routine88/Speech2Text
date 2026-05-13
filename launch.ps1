@@ -671,23 +671,38 @@ except Exception as e:
 # -- Phase 4: Launch -------------------------------------------
 Write-Header "Launching Speech2Text"
 
-# Choose GUI: gui_tk.py (tkinter, cross-platform) > gui.py (GTK4, Linux-only) > CLI
-$guiTk  = Join-Path $REPO_DIR "gui_tk.py"
-$guiGtk = Join-Path $REPO_DIR "gui.py"
-$cli    = Join-Path $REPO_DIR "transcribe.py"
+# gui_tk.py = tkinter-based, cross-platform (preferred when available).
+# gui.py    = GTK4/PyGObject, Linux-only -- DO NOT attempt on Windows. The
+# Windows pip install list intentionally omits PyGObject, so importing it
+# would raise ModuleNotFoundError. That's a non-zero subprocess exit, which
+# does NOT raise a PowerShell terminating error, so a surrounding try/catch
+# would not catch it -- the script would fall through, exit cleanly with
+# code 0, and launch.bat's "pause on non-zero" would never fire. The user
+# would see the error scroll by and the window close. (That was the bug.)
+$cli   = Join-Path $REPO_DIR "transcribe.py"
+$guiTk = Join-Path $REPO_DIR "gui_tk.py"
+
+function Wait-OnExitAlways {
+    param([string] $Reason = "")
+    if ($Reason) { Write-Host "" ; Write-Host $Reason -ForegroundColor Yellow }
+    if ($script:TranscriptPath) { Write-Host "Full log: $script:TranscriptPath" -ForegroundColor DarkGray }
+    try { Read-Host "Press Enter to close this window" | Out-Null } catch {}
+}
 
 if (Test-Path $guiTk) {
     Write-Info "Starting GUI..."
     & $script:VenvPython $guiTk @args
-} elseif (Test-Path $guiGtk) {
-    try {
-        & $script:VenvPython $guiGtk @args
-    } catch {
-        Write-Warn "GTK4 GUI not available on Windows. Falling back to CLI."
-        Write-Info "Usage:  python $cli <audio_file> [options]"
-        & $script:VenvPython $cli --help
+    $rc = $LASTEXITCODE
+    if ($rc -ne 0) {
+        Wait-OnExitAlways "GUI exited with code $rc"
+        exit $rc
     }
 } else {
-    Write-Info "Usage:  python $cli <audio_file> [options]"
+    Write-Info "No Windows GUI yet -- showing CLI help."
+    Write-Info ""
+    Write-Info "  Transcribe a file:"
+    Write-Info "    python `"$cli`" `"path\to\audio.wav`""
+    Write-Info ""
     & $script:VenvPython $cli --help
+    Wait-OnExitAlways "Setup complete. Use the command above to transcribe."
 }
