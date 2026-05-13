@@ -414,9 +414,58 @@ if (-not $anyWork) {
     Write-Ok "All dependencies up to date"
 }
 
+# 3f: HuggingFace token (required for pyannote diarization models)
+& (Join-Path $VENV_DIR "Scripts\Activate.ps1")
+$hfToken = python -c "from huggingface_hub import get_token; t = get_token(); print(t or '')" 2>$null
+if (-not $hfToken -or $hfToken -eq "") {
+    Write-Header "HuggingFace Setup Required"
+    Write-Host ""
+    Write-Host "  Speaker diarization requires a free HuggingFace account."
+    Write-Host ""
+    Write-Host "  Step 1: Create an account at https://huggingface.co (if you don't have one)"
+    Write-Host ""
+    Write-Host "  Step 2: Accept the model licenses (click 'Agree' on each page):"
+    Write-Host "    - https://huggingface.co/pyannote/speaker-diarization-3.1"
+    Write-Host "    - https://huggingface.co/pyannote/segmentation-3.0"
+    Write-Host ""
+    Write-Host "  Step 3: Create an access token at https://huggingface.co/settings/tokens"
+    Write-Host "    - Click 'New token', name it anything, role 'Read'"
+    Write-Host ""
+    $hfInput = Read-Host "  Paste your HuggingFace token here (starts with hf_)"
+    if ($hfInput) {
+        python -c "from huggingface_hub import login; login(token='$hfInput')" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "HuggingFace token saved"
+        } else {
+            Write-Warn "Token may be invalid, but continuing anyway"
+        }
+    } else {
+        Write-Warn "No token entered. Diarization will fail until you set one."
+    }
+} else {
+    $hfAccess = python -c @"
+from huggingface_hub import model_info
+try:
+    model_info('pyannote/speaker-diarization-3.1')
+    print('ok')
+except Exception as e:
+    print(str(e)[:80])
+"@ 2>$null
+    if ($hfAccess -eq "ok") {
+        Write-Ok "HuggingFace: authenticated + model access confirmed"
+    } elseif ($hfAccess -match "gated|403|restricted") {
+        Write-Warn "HuggingFace token found but model access denied."
+        Write-Host ""
+        Write-Host "  You need to accept the license on these pages (click 'Agree'):"
+        Write-Host "    - https://huggingface.co/pyannote/speaker-diarization-3.1"
+        Write-Host "    - https://huggingface.co/pyannote/segmentation-3.0"
+        Write-Host ""
+        Read-Host "  Press Enter after accepting (or just continue)"
+    }
+}
+
 # ── Phase 4: Launch ───────────────────────────────────────────
 Write-Header "Launching Speech2Text"
-& (Join-Path $VENV_DIR "Scripts\Activate.ps1")
 pip install --upgrade pip -q 2>$null
 
 # Choose GUI: gui_tk.py (tkinter, cross-platform) > gui.py (GTK4, Linux-only) > CLI

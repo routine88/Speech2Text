@@ -235,9 +235,60 @@ if [ $needs_venv -eq 0 ] && [ $needs_pip -eq 0 ] && [ $needs_whisper -eq 0 ] && 
     ok "All dependencies up to date"
 fi
 
+# 3g: HuggingFace token (required for pyannote diarization models)
+source "$VENV_DIR/bin/activate"
+HF_TOKEN=$(python3 -c "from huggingface_hub import get_token; t = get_token(); print(t or '')" 2>/dev/null)
+if [ -z "$HF_TOKEN" ]; then
+    header "HuggingFace Setup Required"
+    echo ""
+    echo "  Speaker diarization requires a free HuggingFace account."
+    echo ""
+    echo "  Step 1: Create an account at https://huggingface.co (if you don't have one)"
+    echo ""
+    echo "  Step 2: Accept the model licenses (click 'Agree' on each page):"
+    echo "    - https://huggingface.co/pyannote/speaker-diarization-3.1"
+    echo "    - https://huggingface.co/pyannote/segmentation-3.0"
+    echo ""
+    echo "  Step 3: Create an access token at https://huggingface.co/settings/tokens"
+    echo "    - Click 'New token', name it anything, role 'Read'"
+    echo ""
+    read -p "  Paste your HuggingFace token here (starts with hf_): " hf_input
+    if [ -n "$hf_input" ]; then
+        python3 -c "from huggingface_hub import login; login(token='$hf_input')" 2>&1
+        if [ $? -eq 0 ]; then
+            ok "HuggingFace token saved"
+        else
+            warn "Token may be invalid, but continuing anyway"
+        fi
+    else
+        warn "No token entered. Diarization will fail until you set one."
+        warn "You can run this again or: python3 -c \"from huggingface_hub import login; login()\""
+    fi
+else
+    # Verify model access
+    HF_ACCESS=$(python3 -c "
+from huggingface_hub import model_info
+try:
+    model_info('pyannote/speaker-diarization-3.1')
+    print('ok')
+except Exception as e:
+    print(str(e)[:80])
+" 2>/dev/null)
+    if [ "$HF_ACCESS" = "ok" ]; then
+        ok "HuggingFace: authenticated + model access confirmed"
+    elif echo "$HF_ACCESS" | grep -qi "gated\|403\|restricted"; then
+        warn "HuggingFace token found but model access denied."
+        echo ""
+        echo "  You need to accept the license on these pages (click 'Agree'):"
+        echo "    - https://huggingface.co/pyannote/speaker-diarization-3.1"
+        echo "    - https://huggingface.co/pyannote/segmentation-3.0"
+        echo ""
+        read -p "  Press Enter after accepting (or type 'skip' to continue): " skip_input
+    fi
+fi
+
 # ── Phase 4: Launch ───────────────────────────────────────────
 header "Launching Speech2Text"
-source "$VENV_DIR/bin/activate"
 pip install --upgrade pip -q 2>/dev/null
 # Pick up system paths for ffmpeg etc.
 [ -f /home/linuxbrew/.linuxbrew/bin/brew ] && eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv 2>/dev/null)" || true
