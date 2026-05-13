@@ -6,7 +6,7 @@
 
 .DESCRIPTION
     Place this file anywhere. Double-click launch.bat (or run this script).
-    First run:  clones repo + installs everything (~10-15 min)
+    First run:  installs everything automatically (~10-15 min)
     After that: pulls latest code + launches (~2 sec)
 #>
 
@@ -27,6 +27,21 @@ function Write-Err   ($msg) { Write-Host "[X]  $msg" -ForegroundColor Red }
 function Write-Header($msg) { Write-Host "`n-- $msg --" -ForegroundColor White }
 
 function Test-Command($cmd) { $null -ne (Get-Command $cmd -ErrorAction SilentlyContinue) }
+
+function Install-Winget($packageId, $name) {
+    Write-Info "Installing $name via winget..."
+    $result = winget install --id $packageId --accept-source-agreements --accept-package-agreements -e 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Ok "$name installed"
+        # Refresh PATH so the new tool is available immediately
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+        return $true
+    } else {
+        Write-Err "Failed to install $name"
+        Write-Err ($result | Out-String)
+        return $false
+    }
+}
 
 # ── Phase 0: Self-Update ─────────────────────────────────────
 if ($env:S2T_SELF_UPDATED -ne "1" -and $SELF) {
@@ -49,16 +64,31 @@ if ($env:S2T_SELF_UPDATED -ne "1" -and $SELF) {
     Remove-Item $tmp -ErrorAction SilentlyContinue
 }
 
+# ── Prerequisite: winget ──────────────────────────────────────
+$hasWinget = Test-Command "winget"
+if (-not $hasWinget) {
+    Write-Warn "winget not found. Will try to install dependencies manually."
+    Write-Warn "For best experience, install App Installer from the Microsoft Store."
+}
+
+# ── Prerequisite: Git ─────────────────────────────────────────
+if (-not (Test-Command "git")) {
+    Write-Header "Installing Git"
+    if ($hasWinget) {
+        if (-not (Install-Winget "Git.Git" "Git")) {
+            Write-Err "Cannot proceed without Git. Please install Git manually and rerun."
+            Read-Host "Press Enter to exit"
+            exit 1
+        }
+    } else {
+        Write-Err "Git is required. Download from: https://git-scm.com/download/win"
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+}
+
 # ── Phase 1: Repo Sync ───────────────────────────────────────
 Write-Header "Syncing code"
-
-if (-not (Test-Command "git")) {
-    Write-Err "Git is required but not found."
-    Write-Err "Install with:  winget install Git.Git"
-    Write-Err "Then restart this script."
-    Read-Host "Press Enter to exit"
-    exit 1
-}
 
 if (Test-Path (Join-Path $REPO_DIR ".git")) {
     $pullOutput = git -C $REPO_DIR pull --ff-only origin main 2>&1
@@ -88,14 +118,13 @@ $STATE_DIR = Join-Path $REPO_DIR ".s2t_state"
 $VENV_DIR  = Join-Path $REPO_DIR "venv"
 New-Item -ItemType Directory -Path $STATE_DIR -Force | Out-Null
 
-# Find Python
+# ── Auto-install system dependencies ─────────────────────────
+$needsRestart = $false
+
+# Python
 $PYTHON = $null
 foreach ($candidate in @("python3", "python", "py")) {
     if (Test-Command $candidate) {
-        $tryCmd = $candidate
-        # py launcher needs -3 flag
-        if ($candidate -eq "py") { $tryCmd = "py -3" }
-
         try {
             $verOut = & $candidate --version 2>&1
             if ($verOut -match "(\d+)\.(\d+)") {
@@ -109,12 +138,103 @@ foreach ($candidate in @("python3", "python", "py")) {
     }
 }
 if (-not $PYTHON) {
-    Write-Err "Python 3.10+ is required."
-    Write-Err "Install with:  winget install Python.Python.3.12"
-    Read-Host "Press Enter to exit"
-    exit 1
+    Write-Header "Installing Python"
+    if ($hasWinget) {
+        Install-Winget "Python.Python.3.12" "Python 3.12" | Out-Null
+        # Re-check after install
+        foreach ($candidate in @("python3", "python", "py")) {
+            if (Test-Command $candidate) {
+                try {
+                    $verOut = & $candidate --version 2>&1
+                    if ($verOut -match "(\d+)\.(\d+)") {
+                        $major = [int]$Matches[1]; $minor = [int]$Matches[2]
+                        if ($major -ge 3 -and $minor -ge 10) {
+                            $PYTHON = $candidate
+                            break
+                        }
+                    }
+                } catch {}
+            }
+        }
+    }
+    if (-not $PYTHON) {
+        Write-Err "Python 3.10+ could not be installed automatically."
+        Write-Err "Please install from: https://www.python.org/downloads/"
+        Write-Err "Make sure to check 'Add Python to PATH' during install."
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
 }
 $PYTHON_VER = & $PYTHON --version 2>&1
+Write-Ok "Python: $PYTHON_VER"
+
+# CMake
+if (-not (Test-Command "cmake")) {
+    Write-Header "Installing CMake"
+    if ($hasWinget) {
+        Install-Winget "Kitware.CMake" "CMake" | Out-Null
+    }
+    if (-not (Test-Command "cmake")) {
+        Write-Err "CMake could not be installed automatically."
+        Write-Err "Download from: https://cmake.org/download/"
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+}
+
+# FFmpeg
+if (-not (Test-Command "ffmpeg")) {
+    Write-Header "Installing FFmpeg"
+    if ($hasWinget) {
+        Install-Winget "Gyan.FFmpeg" "FFmpeg" | Out-Null
+    }
+    if (-not (Test-Command "ffmpeg")) {
+        Write-Warn "FFmpeg not installed. Non-WAV audio files won't work."
+        Write-Warn "Install later with: winget install Gyan.FFmpeg"
+    }
+}
+
+# C++ Build Tools — check for cl.exe or Visual Studio
+$hasCL = $false
+if (Test-Command "cl") { $hasCL = $true }
+if (-not $hasCL) {
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $vsPath = & $vswhere -latest -property installationPath 2>$null
+        if ($vsPath) { $hasCL = $true }
+    }
+}
+if (-not $hasCL) {
+    Write-Header "Installing Visual Studio Build Tools"
+    if ($hasWinget) {
+        Write-Info "Installing C++ build tools (this may take several minutes)..."
+        $result = winget install --id Microsoft.VisualStudio.2022.BuildTools `
+            --accept-source-agreements --accept-package-agreements `
+            --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "Visual Studio Build Tools installed"
+            $needsRestart = $true
+        } else {
+            Write-Warn "Build Tools install may need a restart to complete."
+            $needsRestart = $true
+        }
+    } else {
+        Write-Err "C++ Build Tools are required to compile whisper.cpp."
+        Write-Err "Download: https://visualstudio.microsoft.com/visual-cpp-build-tools/"
+        Write-Err "Select 'Desktop development with C++' workload."
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+}
+
+if ($needsRestart) {
+    Write-Warn ""
+    Write-Warn "Build tools were just installed. You may need to restart your terminal"
+    Write-Warn "or reboot for PATH changes to take effect, then double-click launch.bat again."
+    Write-Warn ""
+    Write-Warn "If you just rebooted and see this again, the install may still be finishing."
+    Read-Host "Press Enter to continue anyway (or close and restart)"
+}
 
 # GPU detection (CUDA only on Windows)
 $GPU_BUILD = ""
@@ -134,9 +254,8 @@ if ($nvidiaSmi) {
         if ($gpuName) {
             $GPU_TYPE = "cuda"
             $GPU_BUILD = "-DGGML_CUDA=ON"
-            # Default to cu124 on Windows
             $TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
-            Write-Info "NVIDIA GPU detected: $gpuName"
+            Write-Ok "NVIDIA GPU: $gpuName (CUDA enabled)"
 
             if (Test-Command "nvcc") {
                 $nvccOut = nvcc --version 2>&1
@@ -145,11 +264,12 @@ if ($nvidiaSmi) {
                     if ($cudaVer -like "11.*") {
                         $TORCH_INDEX = "https://download.pytorch.org/whl/cu118"
                     }
-                    Write-Info "CUDA toolkit: $cudaVer"
                 }
             }
         }
     } catch {}
+} else {
+    Write-Info "No NVIDIA GPU detected, using CPU mode"
 }
 
 # Determine what needs work
@@ -157,7 +277,6 @@ $needsVenv     = $false
 $needsPip      = $false
 $needsWhisper  = $false
 $needsModel    = $false
-$needsSyscheck = $false
 
 # Venv
 $venvMarker = Join-Path $STATE_DIR "venv"
@@ -196,52 +315,13 @@ if (-not (Test-Path $modelPath)) {
     $needsModel = $true
 }
 
-# System deps
-$sysMarker = Join-Path $STATE_DIR "system_deps"
-if (-not (Test-Path $sysMarker)) {
-    $needsSyscheck = $true
-}
-
 # ── Phase 3: Install ─────────────────────────────────────────
-$anyWork = $needsSyscheck -or $needsVenv -or $needsPip -or $needsWhisper -or $needsModel
+$anyWork = $needsVenv -or $needsPip -or $needsWhisper -or $needsModel
 if ($anyWork) {
-    Write-Header "Setting up dependencies"
+    Write-Header "Setting up project dependencies"
 }
 
-# 3a: System deps
-if ($needsSyscheck) {
-    $missing = @()
-    if (-not (Test-Command "cmake"))  { $missing += "cmake (winget install Kitware.CMake)" }
-    if (-not (Test-Command "ffmpeg")) { $missing += "ffmpeg (winget install Gyan.FFmpeg)" }
-
-    # Check for C++ compiler
-    $hasCL = $false
-    if (Test-Command "cl") { $hasCL = $true }
-    if (-not $hasCL) {
-        # Try vswhere
-        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-        if (Test-Path $vswhere) {
-            $vsPath = & $vswhere -latest -property installationPath 2>$null
-            if ($vsPath) { $hasCL = $true }
-        }
-    }
-    if (-not $hasCL) {
-        $missing += "Visual Studio Build Tools with C++ (winget install Microsoft.VisualStudio.2022.BuildTools)"
-    }
-
-    if ($missing.Count -gt 0) {
-        Write-Err "Missing required tools:"
-        foreach ($m in $missing) { Write-Err "  - $m" }
-        Write-Err ""
-        Write-Err "Install them and run this script again."
-        Read-Host "Press Enter to exit"
-        exit 1
-    }
-    Set-Content -Path $sysMarker -Value "ok"
-    Write-Ok "System dependencies verified"
-}
-
-# 3b: Venv
+# 3a: Venv
 if ($needsVenv) {
     Write-Info "Creating Python virtual environment..."
     if (Test-Path $VENV_DIR) { Remove-Item $VENV_DIR -Recurse -Force }
@@ -251,7 +331,7 @@ if ($needsVenv) {
     Write-Ok "Virtual environment created"
 }
 
-# 3c: Pip deps
+# 3b: Pip deps
 if ($needsPip) {
     Write-Info "Installing Python packages (this may take a few minutes)..."
     & (Join-Path $VENV_DIR "Scripts\Activate.ps1")
@@ -263,10 +343,11 @@ if ($needsPip) {
     Write-Ok "Python packages installed"
 }
 
-# 3d: whisper.cpp
+# 3c: whisper.cpp
 if ($needsWhisper) {
     if (-not (Test-Command "cmake")) {
-        Write-Err "cmake is required to build whisper.cpp"
+        Write-Err "cmake is required to build whisper.cpp but was not found after install."
+        Write-Err "Please restart your terminal and try again."
         Read-Host "Press Enter to exit"
         exit 1
     }
@@ -282,15 +363,22 @@ if ($needsWhisper) {
     Write-Info "Building whisper.cpp (this may take a few minutes)..."
     $cmakeArgs = @("-B", (Join-Path $WHISPER_DIR "build"), "-S", $WHISPER_DIR, "-DCMAKE_BUILD_TYPE=Release")
     if ($GPU_BUILD) { $cmakeArgs += $GPU_BUILD }
-    cmake @cmakeArgs 2>&1 | Select-Object -Last 3
-    cmake --build (Join-Path $WHISPER_DIR "build") --config Release --target whisper-cli 2>&1 | Select-Object -Last 3
+    cmake @cmakeArgs 2>&1 | Select-Object -Last 5
+    cmake --build (Join-Path $WHISPER_DIR "build") --config Release --target whisper-cli 2>&1 | Select-Object -Last 5
 
-    $newHead = git -C $WHISPER_DIR rev-parse HEAD 2>$null
-    Set-Content -Path (Join-Path $STATE_DIR "whisper_build") -Value $newHead
-    Write-Ok "whisper.cpp built"
+    if (Test-Path $whisperCliPath) {
+        $newHead = git -C $WHISPER_DIR rev-parse HEAD 2>$null
+        Set-Content -Path (Join-Path $STATE_DIR "whisper_build") -Value $newHead
+        Write-Ok "whisper.cpp built"
+    } else {
+        Write-Err "whisper.cpp build failed. The binary was not found at: $whisperCliPath"
+        Write-Err "You may need Visual Studio Build Tools with C++ workload."
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
 }
 
-# 3e: Model
+# 3d: Model
 if ($needsModel) {
     $modelDir = Join-Path $WHISPER_DIR "models"
     New-Item -ItemType Directory -Path $modelDir -Force | Out-Null
@@ -298,17 +386,17 @@ if ($needsModel) {
     $modelDest = Join-Path $modelDir "ggml-$MODEL.bin"
 
     Write-Info "Downloading Whisper $MODEL model (~3GB)..."
-    # Use BITS for better large-file handling, fall back to Invoke-WebRequest
     try {
         Start-BitsTransfer -Source $modelUrl -Destination $modelDest -ErrorAction Stop
     } catch {
+        Write-Info "BITS transfer failed, trying direct download..."
         Invoke-WebRequest -Uri $modelUrl -OutFile $modelDest -UseBasicParsing
     }
     Set-Content -Path (Join-Path $STATE_DIR "whisper_model") -Value $MODEL
     Write-Ok "Model downloaded"
 }
 
-# 3f: VAD model (anti-hallucination)
+# 3e: VAD model (anti-hallucination)
 $vadModelPath = Join-Path $WHISPER_DIR "models\ggml-silero-v6.2.0.bin"
 if (-not (Test-Path $vadModelPath)) {
     $vadUrl = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin"
@@ -339,13 +427,11 @@ if (Test-Path $guiTk) {
     Write-Info "Starting GUI..."
     python $guiTk @args
 } elseif (Test-Path $guiGtk) {
-    # Try GTK4 — will fail on Windows but worth trying if user installed it
     try {
         python $guiGtk @args
     } catch {
         Write-Warn "GTK4 GUI not available on Windows. Falling back to CLI."
         Write-Info "Usage:  python $cli <audio_file> [options]"
-        Write-Info "Run 'python $cli --help' for all options."
         python $cli --help
     }
 } else {
