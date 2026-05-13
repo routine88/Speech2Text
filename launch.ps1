@@ -12,6 +12,14 @@
 
 $ErrorActionPreference = "Continue"
 
+# Force UTF-8 I/O so winget's progress bars (which use box-drawing chars like
+# U+2588 / U+2592) don't render as mojibake ("GUuOuOuO") through the OEM codepage.
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+    $OutputEncoding           = [System.Text.Encoding]::UTF8
+} catch {}
+
 $REPO_URL    = "https://github.com/routine88/Speech2Text.git"
 $RAW_URL     = "https://raw.githubusercontent.com/routine88/Speech2Text/main/launch.ps1"
 $REPO_DIR    = if ($env:S2T_REPO_DIR)       { $env:S2T_REPO_DIR }       else { Join-Path $HOME "Speech2Text" }
@@ -374,33 +382,41 @@ if ($nvidiaSmi) {
             Write-Ok "NVIDIA GPU: $gpuName"
 
             $nvccPath = Find-Nvcc
-            if (-not $nvccPath -and $hasWinget) {
+            if (-not $nvccPath) {
                 # PyTorch CUDA wheels work on the driver alone, but whisper.cpp's
                 # GGML_CUDA backend requires the toolkit (nvcc) at build time.
                 # If we skip this and just build CPU-only, transcription is slow
                 # and the user thinks the GPU isn't being used at all -- because
-                # transcription dominates total time. Offer to install the toolkit.
+                # transcription dominates total time.
                 Write-Warn "CUDA Toolkit (nvcc) not found -- needed to GPU-accelerate transcription."
-                Write-Host ""
-                Write-Host "  Install CUDA Toolkit now? Downloads ~3 GB, takes 5-10 min." -ForegroundColor Yellow
-                Write-Host "  Without it, Whisper transcription runs on CPU (much slower)." -ForegroundColor Yellow
-                $reply = Read-Host "  Install? [Y/n]"
-                if ($reply -eq '' -or $reply -match '^[Yy]') {
-                    Write-Info "Installing CUDA Toolkit via winget (this may take a while)..."
-                    winget install --id Nvidia.CUDA `
-                        --accept-source-agreements --accept-package-agreements -e 2>&1 | Out-Host
-                    # winget often doesn't propagate PATH to the current session,
-                    # but Find-Nvcc probes the standard install root directly.
-                    $nvccPath = Find-Nvcc
-                    if ($nvccPath) {
-                        Write-Ok "CUDA Toolkit installed."
+                if ($hasWinget) {
+                    Write-Host ""
+                    Write-Host "  Install CUDA Toolkit now? Downloads ~2.5 GB, takes 5-15 min." -ForegroundColor Yellow
+                    Write-Host "  Without it, Whisper transcription runs on CPU (much slower)." -ForegroundColor Yellow
+                    $reply = Read-Host "  Install? [Y/n]"
+                    if ($reply -eq '' -or $reply -match '^[Yy]') {
+                        Write-Info "Installing CUDA Toolkit via winget (this may take a while)..."
+                        winget install --id Nvidia.CUDA `
+                            --accept-source-agreements --accept-package-agreements -e 2>&1 | Out-Host
+                        # winget often doesn't propagate PATH to the current session,
+                        # but Find-Nvcc probes the standard install root directly.
+                        $nvccPath = Find-Nvcc
+                        if ($nvccPath) {
+                            Write-Ok "CUDA Toolkit installed."
+                        } else {
+                            Write-Warn "CUDA Toolkit install did not register in this session."
+                            Write-Warn "Reboot and rerun launch.bat to enable GPU transcription."
+                        }
                     } else {
-                        Write-Warn "CUDA Toolkit install did not register in this session."
-                        Write-Warn "Reboot and rerun launch.bat to enable GPU transcription."
+                        Write-Warn "Skipping. Whisper will build CPU-only."
+                        Write-Warn "To enable later: winget install Nvidia.CUDA  (then rerun launch.bat)"
                     }
                 } else {
-                    Write-Warn "Skipping. Whisper will build CPU-only."
-                    Write-Warn "To enable later: winget install Nvidia.CUDA  (then rerun launch.bat)"
+                    # No winget -- can't auto-install. Point at the manual download.
+                    Write-Warn "winget is not available, so we can't install it automatically."
+                    Write-Warn "To enable GPU transcription, install the CUDA Toolkit manually:"
+                    Write-Warn "  https://developer.nvidia.com/cuda-downloads"
+                    Write-Warn "  (Pick Windows / x86_64 / 11 / exe (local)). Then rerun launch.bat."
                 }
             }
 
