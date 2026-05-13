@@ -281,7 +281,33 @@ class TranscribeApp(_RootTk):
             self._log("GPU: None detected (using CPU)")
         if not _HAS_DND:
             self._log("(Drag-and-drop not available -- pip install tkinterdnd2 to enable.)")
+        self._check_torch_cuda_mismatch()
         self._gpu_monitor_start()
+
+    def _check_torch_cuda_mismatch(self):
+        # Detect the case where the system has an NVIDIA GPU + CUDA Toolkit
+        # (so config.detect_gpu() returned "cuda") but the installed torch
+        # wheel was built without CUDA support, or built for a CUDA version
+        # whose arch list doesn't include this card. Either way the diarizer
+        # silently falls back to CPU, which is the bug we want to surface.
+        if GPU_TYPE != "cuda":
+            return
+        try:
+            import torch
+        except ImportError:
+            return
+        if torch.cuda.is_available():
+            return
+        self._log("")
+        self._log("WARNING: NVIDIA GPU detected but torch.cuda.is_available() = False.")
+        self._log("  -> Diarization will run on CPU even though a GPU is present.")
+        ver = getattr(torch, "__version__", "?")
+        if "+cu" not in ver and "+rocm" not in ver:
+            self._log(f"  Cause: installed torch is the CPU wheel ({ver}).")
+        else:
+            self._log(f"  Cause: installed torch ({ver}) does not support this GPU's compute capability.")
+        self._log("  Fix: close this window and re-run launch.bat -- the updated installer")
+        self._log("       picks a torch wheel that matches your CUDA Toolkit version.")
 
     def _build_ui(self):
         main = ttk.Frame(self, padding=10)
