@@ -9,14 +9,17 @@ Override these with environment variables:
 """
 
 import os
+import platform
 import shutil
 import subprocess
 from pathlib import Path
 
-WHISPER_CLI = os.environ.get(
-    "WHISPER_CLI",
-    str(Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"),
-)
+if platform.system() == "Windows":
+    _default_cli = Path.home() / "whisper.cpp" / "build" / "bin" / "Release" / "whisper-cli.exe"
+else:
+    _default_cli = Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"
+
+WHISPER_CLI = os.environ.get("WHISPER_CLI", str(_default_cli))
 
 WHISPER_MODEL = os.environ.get(
     "WHISPER_MODEL",
