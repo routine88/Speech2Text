@@ -62,6 +62,11 @@ def run_whisper(wav_path: str, language: str, threads: int, use_gpu: bool = Fals
             "-of", out_base,
             "-l", language,
             "--suppress-nst",             # suppress non-speech tokens
+            # Anti-hallucination: don't feed decoded text back as context. The
+            # autoregressive feedback is what turns a single wrong phrase into
+            # a "X. Yeah. X. Yeah." infinite loop. -mc 0 makes each 30s window
+            # decode independently.
+            "-mc", "0",
         ]
         # Enable VAD to prevent hallucination loops on long audio
         if os.path.isfile(VAD_MODEL):

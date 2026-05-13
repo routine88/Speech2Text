@@ -110,6 +110,13 @@ def run_whisper(wav_path, language, threads, log_fn, use_gpu=False):
             "-f", wav_path, "-t", str(threads),
             "-oj", "-of", out_base, "-l", language,
             "--suppress-nst",
+            # -mc 0 disables decoder-context feedback. Without it, once Whisper
+            # emits a plausible-but-wrong phrase, that phrase becomes context
+            # for the next decode, biasing the model toward repeating it and
+            # producing the classic "X. Yeah. X. Yeah." infinite loop. With
+            # -mc 0 each 30s window decodes independently. Small quality cost
+            # at segment boundaries, big anti-hallucination win.
+            "-mc", "0",
         ]
         if os.path.isfile(VAD_MODEL):
             cmd += ["--vad", "-vm", str(VAD_MODEL), "--vad-max-speech-duration-s", "30"]
