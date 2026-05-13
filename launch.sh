@@ -131,7 +131,7 @@ elif [ "$(cat "$STATE_DIR/venv" 2>/dev/null)" != "$PYTHON_VER" ]; then
 fi
 
 # Pip deps
-DEP_STRING="numpy soundfile PyGObject pycairo torch torchaudio pyannote.audio|$TORCH_INDEX"
+DEP_STRING="numpy soundfile PyGObject pycairo torch torchaudio pyannote.audio tkinterdnd2|$TORCH_INDEX"
 DEP_HASH=$(echo "$DEP_STRING" | sha256sum | cut -d' ' -f1)
 if [ ! -f "$STATE_DIR/pip_deps" ] || [ "$(cat "$STATE_DIR/pip_deps" 2>/dev/null)" != "$DEP_HASH" ]; then
     needs_pip=1
@@ -214,6 +214,10 @@ if [ $needs_pip -eq 1 ]; then
     pip_install torch torchaudio --index-url "$TORCH_INDEX" -q \
         || { err "Failed to install torch/torchaudio from $TORCH_INDEX"; exit 1; }
     pip_install pyannote.audio -q || { err "Failed to install pyannote.audio"; exit 1; }
+    # Optional: drag-and-drop in the tkinter GUI. Soft-fail since the GTK GUI
+    # is the default on Linux and doesn't need it.
+    pip_install tkinterdnd2 -q 2>/dev/null \
+        || warn "tkinterdnd2 install failed (drag-and-drop in gui_tk.py will be disabled)"
     echo "$DEP_HASH" > "$STATE_DIR/pip_deps"
     ok "Python packages installed"
 fi

@@ -456,7 +456,7 @@ if (-not (Test-Path $venvMarker) -or -not (Test-Path $activateScript)) {
 }
 
 # Pip deps (no PyGObject on Windows)
-$depString = "numpy soundfile torch torchaudio pyannote.audio|$TORCH_INDEX"
+$depString = "numpy soundfile torch torchaudio pyannote.audio tkinterdnd2|$TORCH_INDEX"
 $depHash = (Get-FileHash -InputStream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($depString))) -Algorithm SHA256).Hash
 $pipMarker = Join-Path $STATE_DIR "pip_deps"
 if (-not (Test-Path $pipMarker) -or (Get-Content $pipMarker -ErrorAction SilentlyContinue) -ne $depHash) {
@@ -544,6 +544,12 @@ if ($needsPip) {
     if ($LASTEXITCODE -ne 0) {
         Write-Err "Failed to install pyannote.audio"
         Read-Host "Press Enter to exit"; exit 1
+    }
+    # Optional: enables drag-and-drop in the tkinter GUI. Soft-fail so a wheel
+    # build issue on an exotic Python version doesn't block the whole launch.
+    Invoke-Pip install tkinterdnd2
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "tkinterdnd2 install failed; drag-and-drop in the GUI will be disabled"
     }
     Set-Content -Path $pipMarker -Value $depHash
     Write-Ok "Python packages installed"
